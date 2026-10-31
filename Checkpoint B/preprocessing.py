@@ -7,8 +7,14 @@ model-ready datasets under ``data/model/``:
     stock_{train,test}.parquet   Full history (2015+), all features except news
     news_{train,test}.parquet    News coverage window only, all features
                                  including sentiment
-    regime_{train,test}.parquet  Market-level regime features
-    scalers.joblib               Fitted clip bounds + StandardScaler per dataset
+    regime_{train,test}.parquet  Market-level regime features, including the
+                                 HMM filtered bear-market probability
+    scalers.joblib               Fitted clip bounds + StandardScaler per
+                                 dataset, plus the fitted HMM parameters
+
+The HMM (regime_model.py) is fit on training dates only, and its feature is
+the forward-filtered probability, so no test-period or future data reaches
+the training features.
 
 Splits are chronological by date (80% earliest dates train, 20% latest test),
 never random: shuffling a time series would leak future information into
@@ -30,15 +36,20 @@ import joblib
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
+import regime_model
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
+RAW_DIR = BASE_DIR / "data" / "raw"
 FEATURE_DIR = BASE_DIR / "data" / "features"
 MODEL_DIR = BASE_DIR / "data" / "model"
 
 ID_COLUMNS = ["date", "ticker"]
+# Carried through unscaled (used as a mask, not a feature)
+PASSTHROUGH_COLUMNS = ["eligible"]
 
 # Raw inputs kept in the feature file for reference. Dollar amounts and share
 # counts are not comparable across companies, so they are not model features.
@@ -72,6 +83,9 @@ def fit_scaler(train, features):
     """Fit clip bounds and a StandardScaler on training rows only."""
     lower = train[features].quantile(CLIP_QUANTILES[0])
     upper = train[features].quantile(CLIP_QUANTILES[1])
+    # 0/1 flags for rare events (e.g. earnings_day) would clip to all zeros
+    binary = [c for c in features if train[c].dropna().isin([0, 1]).all()]
+    lower[binary], upper[binary] = 0.0, 1.0
     # StandardScaler ignores NaNs when fitting and keeps them when transforming
     scaler = StandardScaler().fit(train[features].clip(lower, upper, axis=1))
     return {"features": features, "lower": lower, "upper": upper, "scaler": scaler}
@@ -83,7 +97,7 @@ def transform(df, fitted):
     scaled = pd.DataFrame(
         fitted["scaler"].transform(clipped), columns=features, index=df.index
     )
-    id_cols = [c for c in ID_COLUMNS if c in df]
+    id_cols = [c for c in ID_COLUMNS + PASSTHROUGH_COLUMNS if c in df]
     return pd.concat([df[id_cols], scaled], axis=1)
 
 
@@ -126,15 +140,39 @@ def main():
     stock = pd.read_parquet(FEATURE_DIR / "stock_features.parquet")
     regime = pd.read_parquet(FEATURE_DIR / "regime_features.parquet")
 
-    model_features = [c for c in stock.columns if c not in ID_COLUMNS + RAW_COLUMNS]
+    model_features = [
+        c for c in stock.columns if c not in ID_COLUMNS + RAW_COLUMNS + PASSTHROUGH_COLUMNS
+    ]
     news_features = [c for c in NEWS_COLUMNS if c in stock]
     base_features = [c for c in model_features if c not in news_features]
     regime_features = [c for c in regime.columns if c != "date"]
 
     scalers = {"stock": build_dataset("stock", stock, base_features, args.train_frac)}
+    cutoff = scalers["stock"]["cutoff"]
+
+    # Regime HMM: fit on training dates, filtered probabilities for all dates
+    prices = pd.read_parquet(RAW_DIR / "prices.parquet")
+    prices["date"] = prices["date"].astype("datetime64[ns]")
+    adj = prices.pivot(index="date", columns="ticker", values="adj_close").reindex(regime["date"])
+    obs = regime_model.observations(adj)
+    hmm = regime_model.fit(obs[obs.index < cutoff])
+    bear = regime_model.bear_prob(regime_model.filtered_probs(obs.to_numpy(), hmm), hmm)
+    regime["hmm_bear_prob"] = bear
+    regime_features.append("hmm_bear_prob")
+    pd.DataFrame({"date": regime["date"], "hmm_bear_prob": bear}).to_parquet(
+        FEATURE_DIR / "hmm_regime.parquet", index=False
+    )
+    scalers["hmm"] = hmm
+    log.info(
+        "HMM fit on %s -> %s: bear share of train days %.0f%%, of test days %.0f%%",
+        obs.index[0].date(), (cutoff - pd.Timedelta(days=1)).date(),
+        100 * (bear[regime["date"] < cutoff] > 0.5).mean(),
+        100 * (bear[regime["date"] >= cutoff] > 0.5).mean(),
+    )
+
     # Same cutoff as the stock panel so the two can be joined without leakage
     scalers["regime"] = build_dataset(
-        "regime", regime, regime_features, args.train_frac, scalers["stock"]["cutoff"]
+        "regime", regime, regime_features, args.train_frac, cutoff
     )
 
     # Yahoo only serves recent headlines, so sentiment gets its own split

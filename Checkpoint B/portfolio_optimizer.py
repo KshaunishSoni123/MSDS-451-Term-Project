@@ -5,6 +5,7 @@ Runs each stage in order, stopping at the first failure:
 
     ingest      data_ingestion.py       prices, news, SEC filings and facts
     features    feature_engineering.py  point-in-time features + sentiment
+    eda         eda.py                  feature distributions + SEC/news coverage
     preprocess  preprocessing.py        chronological split + scaling
     tune        tune_lstm.py            Optuna search -> best_params.json
     train       lstm_model.py           final LSTM + out-of-sample backtest
@@ -14,6 +15,13 @@ Each stage is its own script and can still be run on its own; this file only
 sequences them and forwards the relevant options.
 
 Usage:
+
+    set up a virtual environment with the requirements in requirements.txt, then run:
+    ./setup_env.sh                     # one-time, ~40s
+    ./run.sh --skip ingest             # pipeline using already-downloaded data
+    ./run.sh                           # full pipeline (needs EDGAR_IDENTITY exported)
+    source .venv/bin/activate          # if you want to run individual scripts by hand
+
     python portfolio_optimizer.py                        # everything
     python portfolio_optimizer.py --skip tune            # reuse existing best_params.json
     python portfolio_optimizer.py --from train           # resume from a stage
@@ -37,6 +45,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STAGES = {
     "ingest": "data_ingestion.py",
     "features": "feature_engineering.py",
+    "eda": "eda.py",
     "preprocess": "preprocessing.py",
     "tune": "tune_lstm.py",
     "train": "lstm_model.py",
@@ -50,14 +59,15 @@ def stage_args(stage, args):
     """Command-line options forwarded to each stage (only those that were set)."""
     forwarded = {
         "ingest": [
-            ("--tickers", args.tickers), ("--start", args.start),
+            ("--tickers", args.tickers), ("--universe", args.universe), ("--start", args.start),
             ("--refresh", args.refresh), ("--skip-sec", args.skip_sec),
             ("--skip-news", args.skip_news),
         ],
         "features": [("--sentiment", args.sentiment)],
+        "eda": [],
         "preprocess": [("--train-frac", args.train_frac)],
-        "tune": [("--trials", args.trials)],
-        "train": [("--default-params", args.default_params)],
+        "tune": [("--trials", args.trials), ("--seeds", args.tune_seeds)],
+        "train": [("--default-params", args.default_params), ("--seeds", args.seeds)],
         "simulate": [("--paths", args.paths), ("--pool-start", args.pool_start)],
     }[stage]
 
@@ -94,15 +104,6 @@ def run_stage(stage, args):
     log.info("=== %s done in %.0fs", stage, elapsed)
 
 
-def check_prerequisites(stages, args):
-    if "ingest" in stages and not args.skip_sec and not os.environ.get("EDGAR_IDENTITY"):
-        sys.exit(
-            "EDGAR_IDENTITY is not set; the SEC requires a contact identity:\n"
-            '  export EDGAR_IDENTITY="Your Name your.email@example.com"\n'
-            "or pass --skip-sec, or --skip ingest to reuse downloaded data."
-        )
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
@@ -114,7 +115,8 @@ def parse_args():
     group.add_argument("--skip", nargs="+", choices=STAGES, help="Skip these stages")
 
     group = parser.add_argument_group("forwarded options")
-    group.add_argument("--tickers", nargs="+", help="ingest: tickers (default: built-in universe)")
+    group.add_argument("--tickers", nargs="+", help="ingest: explicit tickers (overrides --universe)")
+    group.add_argument("--universe", choices=["xbi", "core"], help="ingest: XBI holdings (default) or core 20")
     group.add_argument("--start", help="ingest: history start date")
     group.add_argument("--refresh", action="store_true", help="ingest: re-download cached data")
     group.add_argument("--skip-sec", action="store_true", help="ingest: skip SEC download")
@@ -122,7 +124,9 @@ def parse_args():
     group.add_argument("--sentiment", choices=["finbert", "vader", "none"], help="features: sentiment model")
     group.add_argument("--train-frac", type=float, help="preprocess: fraction of dates for training")
     group.add_argument("--trials", type=int, help="tune: number of Optuna trials")
+    group.add_argument("--tune-seeds", type=int, help="tune: seeds per fold per trial")
     group.add_argument("--default-params", action="store_true", help="train: ignore best_params.json")
+    group.add_argument("--seeds", type=int, help="train: ensemble size")
     group.add_argument("--paths", type=int, help="simulate: number of Monte Carlo paths")
     group.add_argument("--pool-start", help="simulate: first day of history to bootstrap from")
 
@@ -137,7 +141,6 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     stages = selected_stages(args)
-    check_prerequisites(stages, args)
     log.info("Running stages: %s", ", ".join(stages))
 
     started = time.time()
