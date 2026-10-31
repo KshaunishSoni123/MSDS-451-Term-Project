@@ -4,6 +4,7 @@ Data ingestion for the biotech portfolio optimizer.
 Pulls raw data for a universe of biotechnology stocks and writes it to
 parquet files under ``data/raw/`` for downstream feature engineering:
 
+    universe.csv           Biotech universe: snapshot of SPDR XBI holdings
     prices.parquet         Daily OHLCV + adjusted close (yfinance), long format
     company_info.parquet   Snapshot of yfinance profile/valuation fields
     news.parquet           Recent news headlines (yfinance)
@@ -19,16 +20,25 @@ Usage:
     python data_ingestion.py
     python data_ingestion.py --tickers VRTX REGN AMGN --start 2018-01-01
     python data_ingestion.py --skip-sec --refresh
+    python data_ingestion.py --universe core   # the original 20-stock list
+
+The default universe is XBI's current holdings. Point-in-time eligibility
+(listing history, market cap, liquidity) is applied later in
+feature_engineering.py. Yahoo has no prices for delisted companies, so the
+universe still carries survivorship bias from names that left the index.
 """
 
 import argparse
+import io
 import logging
 import os
+import re
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import requests
 import yfinance as yf
 from edgar import Company, set_identity
 
@@ -46,6 +56,11 @@ BIOTECH_TICKERS = [
     "ALNY", "INCY", "BMRN", "NBIX", "UTHR", "EXEL", "INSM",
     "SRPT", "IONS", "NTRA", "HALO", "RYTM", "CRSP", "ACAD",
 ]
+
+XBI_HOLDINGS_URL = (
+    "https://www.ssga.com/us/en/intermediary/library-content/products/"
+    "fund-data/etfs/us/holdings-daily-us-en-xbi.xlsx"
+)
 
 # Benchmarks and safe-haven assets used for relative performance and
 # regime-based rotation (HMM) later on.
@@ -75,6 +90,51 @@ INFO_FIELDS = [
 ]
 
 log = logging.getLogger("data_ingestion")
+
+
+# ---------------------------------------------------------------------------
+# Universe
+# ---------------------------------------------------------------------------
+
+def fetch_xbi_holdings():
+    """Current SPDR S&P Biotech ETF (XBI) holdings as a DataFrame."""
+    resp = requests.get(XBI_HOLDINGS_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+    resp.raise_for_status()
+    raw = pd.read_excel(io.BytesIO(resp.content), header=None)
+    as_of = re.search(r"\d{2}-\w{3}-\d{4}", " ".join(map(str, raw.iloc[:4, 1])))
+    header_row = raw.index[raw.iloc[:, 0].map(str).str.strip() == "Name"][0]
+    holdings = raw.iloc[header_row + 1:].set_axis(list(raw.iloc[header_row]), axis=1)
+    holdings = holdings.dropna(subset=["Ticker"])
+    holdings["Ticker"] = holdings["Ticker"].astype(str).str.strip().str.upper()
+    # Drop cash lines and anything that is not a plain US ticker
+    holdings = holdings[holdings["Ticker"].str.fullmatch(r"[A-Z]{1,5}")]
+    return pd.DataFrame({
+        "ticker": holdings["Ticker"],
+        "name": holdings["Name"],
+        "xbi_weight": pd.to_numeric(holdings["Weight"], errors="coerce"),
+        "as_of": pd.to_datetime(as_of.group(0) if as_of else date.today()),
+    }).reset_index(drop=True)
+
+
+def load_universe(refresh=False):
+    """XBI holdings, cached in universe.csv; falls back to BIOTECH_TICKERS."""
+    path = DATA_DIR / "universe.csv"
+    if path.exists() and not refresh:
+        return pd.read_csv(path)["ticker"].tolist()
+    try:
+        holdings = fetch_xbi_holdings()
+    except Exception as exc:
+        log.warning("Could not download XBI holdings (%s); using the core list", exc)
+        return list(BIOTECH_TICKERS)
+    holdings.to_csv(path, index=False)
+    log.info("Universe: %d XBI holdings as of %s -> %s",
+             len(holdings), holdings["as_of"].iloc[0].date(), path)
+    return holdings["ticker"].tolist()
+
+
+def cached_tickers(name):
+    path = DATA_DIR / f"{name}.parquet"
+    return set(pd.read_parquet(path, columns=["ticker"])["ticker"]) if path.exists() else set()
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +185,13 @@ def fetch_company_info(tickers):
         row = {"ticker": ticker, "as_of": date.today()}
         row.update({field: info.get(field) for field in INFO_FIELDS})
         rows.append(row)
-    return pd.DataFrame(rows)
+    info = pd.DataFrame(rows)
+    # Yahoo sometimes returns strings like 'Infinity' in numeric fields
+    text_fields = {"shortName", "longName", "sector", "industry", "country"}
+    for field in INFO_FIELDS:
+        if field not in text_fields and field in info:
+            info[field] = pd.to_numeric(info[field], errors="coerce")
+    return info
 
 
 def _parse_news_item(ticker, item):
@@ -197,7 +263,7 @@ def fetch_news(tickers, count=50):
 # ---------------------------------------------------------------------------
 
 def configure_edgar_identity():
-    identity = os.environ.get("EDGAR_IDENTITY")
+    identity = "Kshaunish Soni kshaunishsoni123@gmail.com"
     if not identity:
         raise SystemExit(
             "EDGAR_IDENTITY is not set. The SEC requires a contact identity, e.g.\n"
@@ -302,8 +368,10 @@ def is_cached(*names):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--tickers", nargs="+", default=BIOTECH_TICKERS,
-                        help="Biotech tickers to ingest (default: built-in universe)")
+    parser.add_argument("--tickers", nargs="+", default=None,
+                        help="Biotech tickers to ingest (overrides --universe)")
+    parser.add_argument("--universe", choices=["xbi", "core"], default="xbi",
+                        help="xbi: current XBI holdings (default); core: built-in 20 names")
     parser.add_argument("--start", default=DEFAULT_START,
                         help="History start date, YYYY-MM-DD")
     parser.add_argument("--end", default=None, help="History end date, YYYY-MM-DD")
@@ -323,12 +391,21 @@ def main():
     logging.getLogger("yfinance").setLevel(logging.CRITICAL)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    tickers = [t.upper() for t in args.tickers]
+    if args.tickers:
+        tickers = [t.upper() for t in args.tickers]
+    elif args.universe == "core":
+        tickers = list(BIOTECH_TICKERS)
+    else:
+        tickers = load_universe(args.refresh)
     start = pd.Timestamp(args.start)
+    log.info("Ingesting %d biotech tickers", len(tickers))
 
-    if args.refresh or not is_cached("prices", "company_info"):
+    # Re-download when the cache was built for a different universe
+    universe_changed = set(tickers) != cached_tickers("requested_tickers")
+    if args.refresh or universe_changed or not is_cached("prices", "company_info"):
         save(fetch_prices(tickers + BENCHMARK_TICKERS, args.start, args.end), "prices")
         save(fetch_company_info(tickers), "company_info")
+        pd.DataFrame({"ticker": tickers}).to_parquet(DATA_DIR / "requested_tickers.parquet", index=False)
     else:
         log.info("Prices cached; use --refresh to re-download")
 
@@ -337,12 +414,16 @@ def main():
         save(fetch_news(tickers, args.news_count), "news", append_keys=["ticker", "uuid"])
 
     if not args.skip_sec:
-        if args.refresh or not is_cached("sec_companies", "sec_filings", "sec_facts"):
+        sec_stale = not set(tickers) <= cached_tickers("sec_companies") | cached_tickers("sec_skipped")
+        if args.refresh or sec_stale or not is_cached("sec_companies", "sec_filings", "sec_facts"):
             configure_edgar_identity()
             companies, filings, facts = fetch_sec_data(tickers, start)
             save(companies, "sec_companies")
             save(filings, "sec_filings")
             save(facts, "sec_facts")
+            # Remember tickers with no SEC data so they don't force a re-download
+            skipped = sorted(set(tickers) - set(companies["ticker"]))
+            pd.DataFrame({"ticker": skipped}).to_parquet(DATA_DIR / "sec_skipped.parquet", index=False)
         else:
             log.info("SEC data cached; use --refresh to re-download")
 

@@ -4,11 +4,13 @@ Feature engineering for the biotech portfolio optimizer.
 Reads the raw parquet files written by ``data_ingestion.py`` and builds:
 
     data/features/stock_features.parquet   Daily (date, ticker) panel of
-                                           momentum, volatility, quality,
-                                           size/value, cash runway, SEC event
-                                           and news sentiment features
+                                           momentum, realized volatility,
+                                           quality, size/value, cash runway,
+                                           SEC event, earnings calendar and
+                                           news sentiment features
     data/features/regime_features.parquet  Daily market-level features for
-                                           regime detection (VIX, XBI vs TLT, ...)
+                                           regime detection (VIX, XBI vs TLT,
+                                           FOMC / CPI event calendar, ...)
     data/features/news_sentiment.parquet   Scored headlines (cache, so re-runs
                                            only score new articles)
 
@@ -30,6 +32,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from event_calendar import CPI_RELEASES, FOMC_DECISIONS
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -43,6 +47,15 @@ MARKET_PROXY = "XBI"   # biotech benchmark for beta
 MIN_REVENUE = 50e6     # below this, margins are noise (pre-commercial biotech)
 RUNWAY_CAP = 10.0      # years; assigned to cash-flow-positive companies
 STALE_DAYS = 400       # drop fundamentals older than this (missed filings)
+
+# Safe-haven assets the portfolio can rotate into; they get price features
+# only (no fundamentals, events or news) plus an is_safe_haven flag.
+SAFE_HAVENS = ["SHY", "TLT"]
+
+# Point-in-time investability rules for biotech names
+MIN_HISTORY_DAYS = 252        # a year of trading, so 252-day features exist
+MIN_MARKET_CAP = 500e6        # from SEC shares outstanding x price on that day
+MIN_DOLLAR_VOLUME = 5e6       # 63-day average daily dollar volume
 
 # Metric -> (period type, XBRL concepts in priority order). Companies switch
 # tags over time, so for each period the earliest-filed concept is used and
@@ -87,6 +100,10 @@ EIGHT_K_ITEMS = {
     "502": "5.02",  # Executive / director departures and appointments
 }
 
+EARNINGS_ITEM = "2.02"         # 8-K Results of Operations and Financial Condition
+EARNINGS_DEDUP_DAYS = 10       # a 10-Q/10-K this soon after an earnings 8-K is the same event
+EVENT_HORIZON_CAP = 63         # business days; "days to next event" is capped here
+
 FINBERT_MODEL = "ProsusAI/finbert"
 
 log = logging.getLogger("feature_engineering")
@@ -112,6 +129,33 @@ def next_trading_day(timestamps, calendar):
     return out.to_numpy()
 
 
+def business_days_until(dates, next_dates):
+    """Business days from each date to its next event (0 on the event day)."""
+    dates = pd.DatetimeIndex(dates)
+    next_dates = pd.DatetimeIndex(next_dates)
+    out = np.full(len(dates), np.nan)
+    valid = ~next_dates.isna()
+    out[valid] = np.busday_count(
+        dates[valid].values.astype("datetime64[D]"),
+        next_dates[valid].values.astype("datetime64[D]"),
+    )
+    return np.minimum(out, EVENT_HORIZON_CAP)
+
+
+def scheduled_event_features(name, event_dates, calendar):
+    """Day-of flag and countdown for a market-wide event published in advance."""
+    event_dates = pd.DatetimeIndex(sorted(event_dates))
+    idx = event_dates.searchsorted(calendar, side="left")
+    has_next = idx < len(event_dates)
+    next_event = pd.DatetimeIndex(
+        np.where(has_next, event_dates[np.minimum(idx, len(event_dates) - 1)], np.datetime64("NaT"))
+    )
+    return pd.DataFrame({
+        f"{name}_day": calendar.isin(event_dates).astype(float),
+        f"days_to_{name}": business_days_until(calendar, next_event),
+    }, index=calendar)
+
+
 # ---------------------------------------------------------------------------
 # Price-based features: momentum, volatility, beta, liquidity
 # ---------------------------------------------------------------------------
@@ -128,6 +172,8 @@ def price_features(prices, universe):
     ann = np.sqrt(TRADING_DAYS)
     w252 = dict(window=TRADING_DAYS, min_periods=126)
     w63 = dict(window=63, min_periods=42)
+    w21 = dict(window=21, min_periods=15)
+    w5 = dict(window=5, min_periods=4)
 
     # Beta via rolling moments: cov(r, m) / var(m)
     cov = r.mul(m, axis=0).rolling(**w252).mean() - r.rolling(**w252).mean().mul(
@@ -140,9 +186,13 @@ def price_features(prices, universe):
         "mom_12_1": p.shift(21) / p.shift(TRADING_DAYS) - 1,
         "mom_6_1": p.shift(21) / p.shift(126) - 1,
         "ret_1m": p / p.shift(21) - 1,
-        # Volatility
+        # Realized volatility at short, medium and long horizons
+        "vol_5d": r.rolling(**w5).std() * ann,
+        "vol_21d": r.rolling(**w21).std() * ann,
         "vol_63d": r.rolling(**w63).std() * ann,
         "vol_252d": r.rolling(**w252).std() * ann,
+        # Above 1 when the stock is more volatile than usual (vol regime)
+        "vol_ratio_21_252": r.rolling(**w21).std() / r.rolling(**w252).std(),
         "downside_vol_63d": (r.clip(upper=0) ** 2).rolling(**w63).mean() ** 0.5 * ann,
         f"beta_{MARKET_PROXY.lower()}_252d": beta,
         # Biotech gap risk: count of >10% daily moves in the past year
@@ -328,6 +378,81 @@ def event_features(filings, calendar, universe):
 
 
 # ---------------------------------------------------------------------------
+# Earnings calendar
+# ---------------------------------------------------------------------------
+
+def earnings_dates(filings, calendar):
+    """Trading day on which each earnings release first hits the market.
+
+    Earnings are the 8-K item 2.02 press release; companies that skip the 8-K
+    fall back to the 10-Q/10-K filing. Releases accepted after the 4pm ET
+    close are assigned to the next session.
+    """
+    items = filings["items"].fillna("").str.split(",").apply(lambda xs: [x.strip() for x in xs])
+    is_release = (filings["form"] == "8-K") & items.apply(lambda xs: EARNINGS_ITEM in xs)
+    is_report = filings["form"].isin(["10-Q", "10-K"])
+    ev = filings[is_release | is_report].copy()
+
+    et = ev["acceptanceDateTime"].dt.tz_convert("America/New_York").dt.tz_localize(None)
+    session = et.dt.normalize() + pd.to_timedelta((et.dt.hour >= 16).astype(int), unit="D")
+    ev["date"] = next_trading_day(session, calendar)
+    ev = ev.dropna(subset=["date"]).sort_values(["ticker", "date"])
+
+    gap = ev.groupby("ticker")["date"].diff()
+    ev = ev[gap.isna() | (gap > pd.Timedelta(days=EARNINGS_DEDUP_DAYS))]
+    return ev[["ticker", "date"]].reset_index(drop=True)
+
+
+def earnings_features(filings, calendar, universe):
+    """Earnings-day flag and estimated business days to the next release.
+
+    The next release date is not known in advance from SEC data, so it is
+    projected point-in-time: companies report on a steady annual cycle, so
+    each past release + 52 weeks predicts the same quarter's next release.
+    A projection is dropped once an actual release lands within 30 days
+    before it (that quarter has already been reported).
+    """
+    ev = earnings_dates(filings, calendar)
+
+    flag = (
+        ev.assign(n=1.0)
+        .pivot_table(index="date", columns="ticker", values="n", aggfunc="max")
+        .reindex(index=calendar, columns=universe)
+        .fillna(0)
+    )
+
+    days_to = pd.DataFrame(np.nan, index=calendar, columns=universe)
+    t = calendar.values
+    for ticker, actual in ev.groupby("ticker")["date"]:
+        if ticker not in days_to:
+            continue
+        actual = np.sort(actual.values)
+        proj = actual + np.timedelta64(364, "D")
+        # Latest actual release on or before each date
+        last_pos = actual.searchsorted(t, side="right") - 1
+        last = np.where(last_pos >= 0, actual[np.maximum(last_pos, 0)], np.datetime64("NaT"))
+
+        nxt = np.full(len(t), np.datetime64("NaT"), dtype="datetime64[ns]")
+        i = proj.searchsorted(t, side="left")
+        for _ in range(2):  # skip at most one already-reported projection
+            ok = i < len(proj)
+            cand = np.where(ok, proj[np.minimum(i, len(proj) - 1)], np.datetime64("NaT"))
+            reported = ok & (last >= cand - np.timedelta64(30, "D"))
+            take = ok & ~reported & np.isnat(nxt)
+            nxt[take] = cand[take]
+            i = i + reported
+        # Projections come from releases already observed (proj - 364d <= t)
+        nxt[nxt > t + np.timedelta64(364, "D")] = np.datetime64("NaT")
+        days_to[ticker] = business_days_until(calendar, nxt)
+
+    start = filings["filing_date"].min()
+    return stack_features({
+        "earnings_day": flag.loc[flag.index >= start],
+        "days_to_earnings_est": days_to.loc[days_to.index >= start],
+    })
+
+
+# ---------------------------------------------------------------------------
 # News sentiment
 # ---------------------------------------------------------------------------
 
@@ -408,10 +533,30 @@ def sentiment_features(news, calendar, universe, method):
 
 
 # ---------------------------------------------------------------------------
+# Point-in-time eligibility
+# ---------------------------------------------------------------------------
+
+def eligibility(panel):
+    """Flag rows that were investable on that date using only data known then.
+
+    Biotech names need a year of history, enough market cap and enough
+    liquidity; safe havens only need the history.
+    """
+    panel = panel.sort_values(["ticker", "date"])
+    history = panel.groupby("ticker").cumcount() + 1
+    is_safe = panel["ticker"].isin(SAFE_HAVENS)
+    big_enough = np.exp(panel["log_market_cap"]) >= MIN_MARKET_CAP
+    liquid = np.exp(panel["log_dollar_volume_63d"]) >= MIN_DOLLAR_VOLUME
+    panel["is_safe_haven"] = is_safe.astype(float)
+    panel["eligible"] = (history >= MIN_HISTORY_DAYS) & (is_safe | (big_enough & liquid))
+    return panel.sort_values(["date", "ticker"]).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
 # Market regime features
 # ---------------------------------------------------------------------------
 
-def regime_features(prices):
+def regime_features(prices, calendar):
     px = prices.pivot(index="date", columns="ticker", values="adj_close")
     rets = px.pct_change(fill_method=None)
     vix = px["^VIX"]
@@ -420,7 +565,7 @@ def regime_features(prices):
     def ret(t, n=63):
         return px[t] / px[t].shift(n) - 1
 
-    return pd.DataFrame({
+    features = pd.DataFrame({
         "vix": vix,
         "vix_change_21d": vix - vix.shift(21),
         "vix_zscore_252d": (vix - vix.rolling(**w252).mean()) / vix.rolling(**w252).std(),
@@ -432,6 +577,14 @@ def regime_features(prices):
         "xbi_drawdown_252d": px["XBI"] / px["XBI"].rolling(**w252).max() - 1,
         "spy_drawdown_252d": px["SPY"] / px["SPY"].rolling(**w252).max() - 1,
     }).dropna(how="all")
+
+    # Scheduled macro events: FOMC decisions (2pm ET) and CPI (8:30am ET)
+    # both land during the session, so the flag is on the release day itself
+    events = pd.concat([
+        scheduled_event_features("fomc", FOMC_DECISIONS, calendar),
+        scheduled_event_features("cpi", CPI_RELEASES, calendar),
+    ], axis=1)
+    return features.join(events)
 
 
 # ---------------------------------------------------------------------------
@@ -452,13 +605,15 @@ def main():
 
     prices = pd.read_parquet(RAW_DIR / "prices.parquet")
     prices["date"] = prices["date"].astype("datetime64[ns]")
-    universe = sorted(pd.read_parquet(RAW_DIR / "company_info.parquet")["ticker"])
+    priced = set(prices["ticker"])
+    biotech = sorted(set(pd.read_parquet(RAW_DIR / "company_info.parquet")["ticker"]) & priced)
+    universe = biotech + SAFE_HAVENS
     calendar = pd.DatetimeIndex(sorted(prices.loc[prices["ticker"] == MARKET_PROXY, "date"]))
     # Yahoo occasionally quotes ^VIX on market holidays; those rows would
     # insert empty days into every stock's rolling windows
     prices = prices[prices["date"].isin(calendar)]
 
-    log.info("Price features for %d tickers", len(universe))
+    log.info("Price features for %d biotech tickers + %s", len(biotech), SAFE_HAVENS)
     panel = price_features(prices, universe)
 
     log.info("SEC fundamentals")
@@ -470,17 +625,22 @@ def main():
     filings = pd.read_parquet(RAW_DIR / "sec_filings.parquet")
     panel = panel.join(event_features(filings, calendar, universe))
 
+    log.info("Earnings calendar")
+    panel = panel.join(earnings_features(filings, calendar, universe))
+
     news_path = RAW_DIR / "news.parquet"
     if args.sentiment != "none" and news_path.exists():
         log.info("News sentiment (%s)", args.sentiment)
         news = pd.read_parquet(news_path)
         panel = panel.join(sentiment_features(news, calendar, universe, args.sentiment))
 
-    panel = panel.reset_index()
+    panel = eligibility(panel.reset_index())
+    eligible_now = panel.loc[panel["date"] == panel["date"].max(), "eligible"].sum()
+    log.info("Eligible assets on the last date: %d of %d", eligible_now, len(universe))
     panel.to_parquet(FEATURE_DIR / "stock_features.parquet", index=False)
     log.info("Saved stock_features: %d rows x %d cols", *panel.shape)
 
-    regime = regime_features(prices).reset_index()
+    regime = regime_features(prices, calendar).reset_index()
     regime.to_parquet(FEATURE_DIR / "regime_features.parquet", index=False)
     log.info("Saved regime_features: %d rows x %d cols", *regime.shape)
 

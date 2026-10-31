@@ -1,0 +1,14 @@
+{
+  "hidden": 32,
+  "dropout": 0.3511997153074965,
+  "lr": 0.0004984935346075733,
+  "weight_decay": 0.00021092311807811728,
+  "batch_size": 32,
+  "assets_per_batch": 64,
+  "min_epochs": 5,
+  "max_weight": 0.05,
+  "turnover_penalty": 0.002592585490022983,
+  "concentration_penalty": 0.0,
+  "rank_loss_weight": 0.012394914930869293,
+  "train_hold_days": 21
+}
