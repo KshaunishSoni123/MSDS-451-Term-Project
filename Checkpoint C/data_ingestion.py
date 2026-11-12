@@ -4,7 +4,7 @@ Data ingestion for the biotech portfolio optimizer.
 Pulls raw data for a universe of biotechnology stocks and writes it to
 parquet files under ``data/raw/`` for downstream feature engineering:
 
-    universe.csv           Biotech universe: snapshot of SPDR XBI holdings
+    universe.csv           XBI holdings snapshot (only with --universe xbi)
     prices.parquet         Daily OHLCV + adjusted close (yfinance), long format,
                            with Bollinger Band columns (SMA, bands, %B, bandwidth)
     company_info.parquet   Snapshot of yfinance profile/valuation fields
@@ -22,9 +22,10 @@ Usage:
     python data_ingestion.py --tickers VRTX REGN AMGN --start 2018-01-01
     python data_ingestion.py --years 10 --bb-window 20 --bb-std 2
     python data_ingestion.py --skip-sec --refresh
-    python data_ingestion.py --universe core   # the original 20-stock list
+    python data_ingestion.py --universe xbi    # current XBI holdings instead
 
-The default universe is XBI's current holdings. Point-in-time eligibility
+The default universe is the 20 names in BIOTECH_TICKERS (core), the same
+stocks as Checkpoint B. Point-in-time eligibility
 (listing history, market cap, liquidity) is applied later in
 feature_engineering.py. Yahoo has no prices for delisted companies, so the
 universe still carries survivorship bias from names that left the index.
@@ -245,8 +246,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--tickers", nargs="+", default=None,
                         help="Biotech tickers to ingest (overrides --universe)")
-    parser.add_argument("--universe", choices=["xbi", "core"], default="xbi",
-                        help="xbi: current XBI holdings (default); core: built-in 20 names")
+    parser.add_argument("--universe", choices=["xbi", "core"], default="core",
+                        help="core: built-in 20 names (default); xbi: current XBI holdings")
     parser.add_argument("--start", default=None,
                         help=f"History start date, YYYY-MM-DD (default: {HISTORY_YEARS} years ago, {DEFAULT_START})")
     parser.add_argument("--years", type=int, default=None,

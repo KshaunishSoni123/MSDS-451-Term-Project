@@ -259,7 +259,7 @@ def parse_args():
     parser.add_argument("--trend-window", type=int, default=200, help="Regime filter SMA window")
     parser.add_argument("--no-trend-filter", action="store_true", help="Disable the 200-day SMA filter")
     parser.add_argument("--long-only", action="store_true", help="Disable short entries")
-    parser.add_argument("--cost-bps", type=float, default=5.0, help="Cost per unit traded, in bps")
+    parser.add_argument("--cost-bps", type=float, default=10.0, help="Cost per unit traded, in bps")
     add_exposure_args(parser)
     return parser.parse_args()
 

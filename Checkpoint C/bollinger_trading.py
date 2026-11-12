@@ -45,7 +45,7 @@ Outputs: data/results/bb_metrics.csv          per-ticker and portfolio metrics
 Usage:
     python bollinger_trading.py
     python bollinger_trading.py --tickers VRTX REGN AMGN --k 2.5 --window 20
-    python bollinger_trading.py --no-trend-filter --cost-bps 10
+    python bollinger_trading.py --no-trend-filter --cost-bps 20
     python bollinger_trading.py --sweep
 """
 
@@ -74,11 +74,16 @@ log = logging.getLogger("bollinger_trading")
 # Performance metrics
 # ---------------------------------------------------------------------------
 
-def performance_metrics(returns):
-    """Annualized summary statistics for a daily simple-return series."""
+def performance_metrics(returns, rf=None):
+    """Annualized summary statistics for a daily simple-return series.
+
+    ``rf`` (a daily return series, e.g. SHY) makes Sharpe use excess returns,
+    matching Checkpoint B; without it Sharpe uses raw returns.
+    """
     r = returns.dropna()
     if r.empty:
         return {}
+    excess = r - rf.reindex(r.index).fillna(0) if rf is not None else r
     equity = (1 + r).cumprod()
     years = len(r) / TRADING_DAYS
     vol = r.std() * np.sqrt(TRADING_DAYS)
@@ -92,7 +97,7 @@ def performance_metrics(returns):
         "total_return": total,
         "cagr": cagr,
         "ann_vol": vol,
-        "sharpe": r.mean() / r.std() * np.sqrt(TRADING_DAYS) if r.std() > 0 else np.nan,
+        "sharpe": excess.mean() / excess.std() * np.sqrt(TRADING_DAYS) if excess.std() > 0 else np.nan,
         "sortino": r.mean() * TRADING_DAYS / downside if downside > 0 else np.nan,
         "max_drawdown": drawdown.min(),
         "calmar": cagr / -drawdown.min() if drawdown.min() < 0 else np.nan,
@@ -143,7 +148,7 @@ class BollingerMeanReversion:
     trend_window: int = 200
     use_trend_filter: bool = True
     allow_short: bool = True
-    cost_bps: float = 5.0
+    cost_bps: float = 10.0
     baseline: float = 1.0
     long_exposure: float = 1.5
     short_exposure: float = 0.5
@@ -472,7 +477,7 @@ def parse_args():
     parser.add_argument("--trend-window", type=int, default=200, help="Regime filter SMA window")
     parser.add_argument("--no-trend-filter", action="store_true", help="Disable the 200-day SMA filter")
     parser.add_argument("--long-only", action="store_true", help="Disable short entries")
-    parser.add_argument("--cost-bps", type=float, default=5.0, help="Cost per unit traded, in bps")
+    parser.add_argument("--cost-bps", type=float, default=10.0, help="Cost per unit traded, in bps")
     add_exposure_args(parser)
     parser.add_argument("--start", default=None, help="Only trade from this date, YYYY-MM-DD")
     parser.add_argument("--min-history", type=int, default=250,
