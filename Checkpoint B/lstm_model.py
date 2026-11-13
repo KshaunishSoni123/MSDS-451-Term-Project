@@ -20,10 +20,19 @@ noise; evaluation always uses the real quarterly (HOLD_DAYS) rebalance.
 
 Architecture: one LSTM is shared across all assets. For each asset it reads
 that asset's features plus the market regime features (including the HMM bear
-probability) and emits a score; a softmax across eligible assets, capped per
-asset (MAX_WEIGHT for stocks, SAFE_MAX_WEIGHT for safe havens), gives the
-weights. Each training batch uses a random subset of stocks plus the safe
-havens, which speeds training on a large universe and regularizes the model.
+probability) and emits a score. Scores become weights through an
+equal-weight anchor and a bond limit (``anchored_weights``):
+
+    stocks  (1 - bond) * [(1 - tilt) * equal_weight + tilt * active]
+    bonds   bond = bond_limit * (share of a softmax over all assets that
+            goes to SHY + TLT), split between them by their scores
+
+``active`` is a softmax over tradable stocks, capped so no stock exceeds
+max_weight. tilt = 0 is plain equal weight and tilt = 1 lets the model move
+the whole stock sleeve; every tradable stock keeps at least
+(1 - bond) * (1 - tilt) / n. SHY + TLT together never exceed bond_limit.
+Each training batch uses a random subset of stocks plus the safe havens,
+which speeds training on a large universe and regularizes the model.
 
 The deployed model is an ensemble: N_SEEDS models trained with different
 seeds whose weights are averaged, since a single Sharpe-trained network varies
@@ -32,6 +41,13 @@ a lot from seed to seed.
 Validation uses walk-forward folds inside the training period. The validation
 score is the net-of-cost Sharpe of actual quarterly rebalancing over the full
 universe, averaged over every possible rebalance phase.
+
+Refit: each seed is first trained with early stopping on the last validation
+fold, which picks its epoch count. It is then retrained from scratch on every
+training-period day (train + validation) for that many epochs, so the deployed
+model has seen data up to the start of the test period rather than stopping
+before the validation window. The logged validation Sharpe comes from the
+early-stopped models, before the refit (--no-refit skips the refit).
 
 Outputs:
     data/model/lstm.pt                     Ensemble weights + params
@@ -73,9 +89,12 @@ TRADING_DAYS = 252
 WARMUP_DAYS = 252      # skip the first year, where 252-day features are empty
 RISK_FREE = "SHY"      # cash proxy for excess returns
 BENCHMARK = "XBI"
-COST_BPS = 10          # transaction cost per unit of turnover
-MAX_WEIGHT = 0.05      # per-stock cap (the 5% diversified-fund limit)
-SAFE_MAX_WEIGHT = 0.5  # per safe-haven cap; SHY + TLT can reach 100%
+COMMISSION_BPS = 5     # brokerage commission per unit of turnover
+SLIPPAGE_BPS = 5       # execution slippage per unit of turnover
+COST_BPS = COMMISSION_BPS + SLIPPAGE_BPS   # Trading_Cost = |w_t - w_{t-1}| x COST_BPS
+MAX_WEIGHT = 0.15     # per-stock cap (with 20 stocks, 5% would allow no overweights)
+TILT = 0.5             # share of the stock sleeve the model may move away from equal weight
+BOND_LIMIT = 0.25      # SHY + TLT combined never exceed this
 N_FOLDS = 3            # walk-forward validation folds
 N_SEEDS = 5            # ensemble size
 SEED = 451
@@ -91,6 +110,8 @@ DEFAULT_PARAMS = {
     "assets_per_batch": 64,       # stocks sampled per batch (safe havens always in)
     "min_epochs": 5,              # early stopping can't select earlier epochs
     "max_weight": MAX_WEIGHT,
+    "tilt": TILT,
+    "bond_limit": BOND_LIMIT,
     "turnover_penalty": 0.0,
     "concentration_penalty": 0.0,
     "rank_loss_weight": 0.0,
@@ -166,12 +187,6 @@ def to_tensors(data):
     }
 
 
-def asset_caps(data, max_weight):
-    return torch.where(
-        torch.from_numpy(data["is_safe"]), SAFE_MAX_WEIGHT, max_weight
-    ).float().to(DEVICE)
-
-
 def window_inputs(asset_x, regime_x, idx, assets=None, lookback=LOOKBACK):
     """Model input for decisions at day indices ``idx``: (B, L, N, Fa + Fr).
 
@@ -227,50 +242,83 @@ def cap_weights(weights, caps, iters=30):
     return w
 
 
+def anchored_weights(scores, tradable, is_safe, tilt, bond_limit, max_weight):
+    """Scores (B, N) -> weights (B, N): equal-weight anchor plus capped bonds.
+
+    See the module docstring. Every step is differentiable, so training sees
+    the same constraints as deployment.
+    """
+    stock = tradable & ~is_safe
+    safe = tradable & is_safe
+    n = stock.sum(1, keepdim=True).clamp(min=1).float()
+    equal = stock.float() / n
+
+    # Active stock portfolio, capped so the blend keeps every stock <= max_weight
+    active = torch.softmax(scores.masked_fill(~stock, float("-inf")), dim=1)
+    if tilt > 0:
+        active = cap_weights(active, torch.maximum((max_weight - (1 - tilt) / n) / tilt, 1 / n))
+    stock_w = (1 - tilt) * equal + tilt * active
+
+    # Bond sleeve: how much of the limit to use, and the SHY/TLT split
+    everything = torch.softmax(scores.masked_fill(~tradable, float("-inf")), dim=1)
+    bond = bond_limit * (everything * safe).sum(1, keepdim=True)
+    split = torch.softmax(scores.masked_fill(~safe, -1e9), dim=1) * safe
+    return (1 - bond) * stock_w + bond * split
+
+
 class PortfolioLSTM(nn.Module):
-    def __init__(self, n_features, hidden=32, dropout=0.2):
+    def __init__(self, n_features, hidden=32, dropout=0.2, tilt=TILT,
+                 bond_limit=BOND_LIMIT, max_weight=MAX_WEIGHT):
         super().__init__()
         self.lstm = nn.LSTM(n_features, hidden, batch_first=True)
         self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(hidden, 1))
+        self.tilt, self.bond_limit, self.max_weight = tilt, bond_limit, max_weight
 
-    def forward(self, x, tradable, caps):
-        """x: (B, L, N, F), tradable: (B, N) bool, caps: (N,) -> weights (B, N)."""
+    def forward(self, x, tradable, is_safe):
+        """x: (B, L, N, F), tradable: (B, N) bool, is_safe: (N,) bool -> weights (B, N)."""
         b, l, n, f = x.shape
         seq = x.permute(0, 2, 1, 3).reshape(b * n, l, f)
         _, (h, _) = self.lstm(seq)
         scores = self.head(h[-1]).view(b, n)
-        weights = torch.softmax(scores.masked_fill(~tradable, float("-inf")), dim=1)
-        return cap_weights(weights, caps)
+        return anchored_weights(scores, tradable, is_safe, self.tilt, self.bond_limit,
+                                self.max_weight)
+
+
+def build_model(n_features, params):
+    return PortfolioLSTM(n_features, hidden=params["hidden"], dropout=params["dropout"],
+                         tilt=params["tilt"], bond_limit=params["bond_limit"],
+                         max_weight=params["max_weight"])
 
 
 class Ensemble(nn.Module):
-    """Averages the weights of several models (still within every cap)."""
+    """Averages the weights of several models (still within every constraint,
+    since each one is a convex combination of the same pieces)."""
 
-    def __init__(self, models, caps):
+    def __init__(self, models, is_safe):
         super().__init__()
         self.models = nn.ModuleList(models)
-        self.register_buffer("caps", caps)
+        self.register_buffer("is_safe", torch.as_tensor(is_safe, dtype=torch.bool))
 
-    def forward(self, x, tradable, caps=None):
-        caps = self.caps if caps is None else caps
-        return torch.stack([m(x, tradable, caps) for m in self.models]).mean(0)
+    def forward(self, x, tradable, is_safe=None):
+        is_safe = self.is_safe if is_safe is None else is_safe
+        return torch.stack([m(x, tradable, is_safe) for m in self.models]).mean(0)
 
 
-def predict(model, x, tradable, caps=None):
+def predict(model, x, tradable, is_safe=None):
     """Weights as float64 numpy for inputs on any device."""
     with torch.no_grad():
         args = (x.to(DEVICE), tradable.to(DEVICE))
-        w = model(*args) if caps is None else model(*args, caps)
+        w = model(*args) if is_safe is None else model(*args, is_safe)
     return w.cpu().double().numpy()
 
 
-def predict_weights(model, t, days, caps=None, chunk=16):
+def predict_weights(model, t, days, is_safe=None, chunk=16):
     model.eval()
     out = []
     for i in range(0, len(days), chunk):
         idx = torch.as_tensor(days[i:i + chunk], device=DEVICE)
         x = window_inputs(t["asset_x"], t["regime_x"], idx)
-        out.append(predict(model, x, t["tradable"][idx], caps))
+        out.append(predict(model, x, t["tradable"][idx], is_safe))
     return np.concatenate(out)
 
 
@@ -337,10 +385,10 @@ def batch(t, idx, assets, hold):
     }
 
 
-def regularized_loss(model, b, params, caps):
-    w = model(b["x"], b["tradable"], caps)
+def regularized_loss(model, b, params):
+    w = model(b["x"], b["tradable"], b["is_safe"])
     with torch.no_grad():
-        w_prev = model(b["x_prev"], b["tradable_prev"], caps)
+        w_prev = model(b["x_prev"], b["tradable_prev"], b["is_safe"])
     trade = turnover(w, w_prev, b["past"])
 
     port = holding_returns(w, b["fwd"])
@@ -363,7 +411,7 @@ def regularized_loss(model, b, params, caps):
 # Validation: net Sharpe of real quarterly rebalancing
 # ---------------------------------------------------------------------------
 
-def evaluate(model, data, t, days, caps=None, weights=None):
+def evaluate(model, data, t, days, is_safe=None, weights=None):
     """Net-of-cost Sharpe of quarterly rebalancing over ``days``.
 
     Averaged over every rebalance phase (start offset 0..HOLD_DAYS-1). The
@@ -372,7 +420,7 @@ def evaluate(model, data, t, days, caps=None, weights=None):
     passed instead of a model to score any weighting rule.
     """
     if weights is None:
-        weights = predict_weights(model, t, days, caps)
+        weights = predict_weights(model, t, days, is_safe)
     returns = np.nan_to_num(data["returns"])
     sharpes, trades = [], []
     for offset in range(HOLD_DAYS):
@@ -411,19 +459,23 @@ def sample_assets(rng, data, idx, k):
 
 
 def train(data, params, train_days, val_days, epochs=60, patience=10, seed=SEED,
-          verbose=True, t=None):
+          verbose=True, t=None, fixed_epochs=None):
     """Train one model with early stopping on validation net Sharpe.
 
-    Returns the best model and its validation metrics.
+    Returns the best model and its validation metrics. With ``fixed_epochs``
+    (the refit), it trains exactly that many epochs with no validation and
+    returns the final model and None.
     """
+    if fixed_epochs is not None:
+        epochs, val_days = fixed_epochs, None
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     t = to_tensors(data) if t is None else t
-    caps = asset_caps(data, params["max_weight"])
+    is_safe = t["is_safe"]
     min_epochs = min(params["min_epochs"], epochs)
 
     n_features = t["asset_x"].shape[-1] + t["regime_x"].shape[-1]
-    model = PortfolioLSTM(n_features, hidden=params["hidden"], dropout=params["dropout"]).to(DEVICE)
+    model = build_model(n_features, params).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=params["lr"], weight_decay=params["weight_decay"])
 
     best, best_state, stale = None, None, 0
@@ -435,14 +487,20 @@ def train(data, params, train_days, val_days, epochs=60, patience=10, seed=SEED,
             idx_np = perm[i:i + params["batch_size"]]
             assets = sample_assets(rng, data, idx_np, params["assets_per_batch"])
             b = batch(t, torch.as_tensor(idx_np, device=DEVICE), assets, params["train_hold_days"])
-            loss, s = regularized_loss(model, b, params, caps[assets])
+            loss, s = regularized_loss(model, b, params)
             opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             stats.append(s)
 
-        val = evaluate(model, data, t, val_days, caps)
+        if val_days is None:
+            if verbose:
+                tr = pd.DataFrame(stats).mean()
+                log.info("seed %d refit epoch %3d/%d  train Sharpe %6.3f turnover %.3f",
+                         seed, epoch, epochs, tr["sharpe"], tr["turnover"])
+            continue
+        val = evaluate(model, data, t, val_days, is_safe)
         if verbose:
             tr = pd.DataFrame(stats).mean()
             log.info(
@@ -461,6 +519,8 @@ def train(data, params, train_days, val_days, epochs=60, patience=10, seed=SEED,
             if stale >= patience:
                 break
 
+    if val_days is None:
+        return model.eval(), None
     model.load_state_dict(best_state)
     return model.eval(), best
 
@@ -475,8 +535,20 @@ def train_ensemble(data, params, train_days, val_days, n_seeds=N_SEEDS, epochs=6
         log.info("seed %d: best epoch %d, val net Sharpe %.3f", SEED + k, best["epoch"], best["sharpe"])
         models.append(model)
         bests.append(best)
-    ensemble = Ensemble(models, asset_caps(data, params["max_weight"])).to(DEVICE).eval()
+    ensemble = Ensemble(models, data["is_safe"]).to(DEVICE).eval()
     return ensemble, bests, t
+
+
+def refit_ensemble(data, params, days, bests, t, verbose=True):
+    """Retrain each seed from scratch on ``days`` for its early-stopped epoch count."""
+    models = []
+    for k, best in enumerate(bests):
+        model, _ = train(data, params, days, None, seed=SEED + k, verbose=verbose, t=t,
+                         fixed_epochs=best["epoch"])
+        log.info("seed %d: refit %d epochs on %s -> %s", SEED + k, best["epoch"],
+                 data["dates"][days[0]].date(), data["dates"][days[-1]].date())
+        models.append(model)
+    return Ensemble(models, data["is_safe"]).to(DEVICE).eval()
 
 
 def load_params(use_default=False):
@@ -504,14 +576,13 @@ def save_model(ensemble, data, params):
 
 def load_model():
     ckpt = torch.load(MODEL_DIR / "lstm.pt", weights_only=False)
-    p = ckpt["params"]
+    p = {**DEFAULT_PARAMS, **ckpt["params"]}
     models = []
     for state in ckpt["state_dicts"]:
-        m = PortfolioLSTM(ckpt["n_features"], hidden=p["hidden"], dropout=p["dropout"])
+        m = build_model(ckpt["n_features"], p)
         m.load_state_dict(state)
         models.append(m)
-    caps = torch.where(torch.from_numpy(ckpt["is_safe"]), SAFE_MAX_WEIGHT, p["max_weight"]).float()
-    return Ensemble(models, caps).to(DEVICE).eval(), ckpt
+    return Ensemble(models, ckpt["is_safe"]).to(DEVICE).eval(), ckpt
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +665,11 @@ def backtest(model, data, t=None):
     metrics.loc["lstm", "avg_max_weight"] = stocks.max(axis=1).mean()
     metrics.loc["lstm", "avg_safe_weight"] = weights.loc[:, data["is_safe"]].sum(axis=1).mean()
     metrics.loc["lstm", "avg_holdings_over_1pct"] = (stocks > 0.01).sum(axis=1).mean()
+    # Active share of the stock sleeve vs equal weight over the stocks it could hold
+    sleeve = stocks.div(stocks.sum(axis=1), axis=0)
+    held = sleeve > 0
+    equal = held.div(held.sum(axis=1), axis=0)
+    metrics.loc["lstm", "avg_active_share"] = 0.5 * (sleeve - equal).abs().sum(axis=1).mean()
     return daily, weights, metrics
 
 
@@ -608,6 +684,15 @@ def parse_args():
     parser.add_argument("--seeds", type=int, default=N_SEEDS, help="Ensemble size")
     parser.add_argument("--default-params", action="store_true",
                         help="Ignore best_params.json and use DEFAULT_PARAMS")
+    parser.add_argument("--max-weight", type=float, default=None,
+                        help=f"Per-stock weight cap (default: tuned params, else {MAX_WEIGHT})")
+    parser.add_argument("--tilt", type=float, default=None,
+                        help=f"Share of the stock sleeve the model may move away from equal weight "
+                             f"(default: tuned params, else {TILT})")
+    parser.add_argument("--bond-limit", type=float, default=None,
+                        help=f"Max combined SHY + TLT weight (default: tuned params, else {BOND_LIMIT})")
+    parser.add_argument("--no-refit", action="store_true",
+                        help="Deploy the early-stopped models instead of refitting on all training days")
     return parser.parse_args()
 
 
@@ -618,6 +703,12 @@ def main():
 
     data = load_inputs()
     params = load_params(args.default_params)
+    for key in ("max_weight", "tilt", "bond_limit"):
+        if getattr(args, key) is not None:
+            params[key] = getattr(args, key)
+            log.info("%s overridden: %s", key, params[key])
+    log.info("Equal-weight anchor: tilt %.2f, per-stock cap %.0f%%, bonds <= %.0f%%",
+             params["tilt"], 100 * params["max_weight"], 100 * params["bond_limit"])
     log.info("%d assets (%d safe havens), %d asset features, %d regime features, %d days, device %s",
              len(data["tickers"]), data["is_safe"].sum(), len(data["asset_features"]),
              len(data["regime_features"]), len(data["dates"]), DEVICE)
@@ -633,6 +724,13 @@ def main():
     log.info("Ensemble of %d: val net Sharpe %.3f (single models %.3f ± %.3f)",
              args.seeds, val["sharpe"], np.mean([b["sharpe"] for b in bests]),
              np.std([b["sharpe"] for b in bests]))
+    ew = evaluate(None, data, t, val_days,
+                  weights=equal_weights(data["tradable"][val_days], data["is_safe"]))
+    log.info("Equal weight on the same validation window: net Sharpe %.3f (model %+.3f vs equal weight)",
+             ew["sharpe"], val["sharpe"] - ew["sharpe"])
+    if not args.no_refit:
+        all_days = decision_days(data)
+        ensemble = refit_ensemble(data, params, all_days, bests, t)
     save_model(ensemble, data, params)
 
     daily, weights, metrics = backtest(ensemble, data, t)

@@ -66,8 +66,12 @@ def stage_args(stage, args):
         "features": [("--sentiment", args.sentiment)],
         "eda": [],
         "preprocess": [("--train-frac", args.train_frac)],
-        "tune": [("--trials", args.trials), ("--seeds", args.tune_seeds)],
-        "train": [("--default-params", args.default_params), ("--seeds", args.seeds)],
+        "tune": [("--trials", args.trials), ("--seeds", args.tune_seeds),
+                 ("--max-weight", args.max_weight), ("--bond-limit", args.bond_limit),
+                 ("--tilt", args.tilt)],
+        "train": [("--default-params", args.default_params), ("--seeds", args.seeds),
+                  ("--max-weight", args.max_weight), ("--bond-limit", args.bond_limit),
+                  ("--tilt", args.tilt), ("--no-refit", args.no_refit)],
         "simulate": [("--paths", args.paths), ("--pool-start", args.pool_start)],
     }[stage]
 
@@ -116,7 +120,7 @@ def parse_args():
 
     group = parser.add_argument_group("forwarded options")
     group.add_argument("--tickers", nargs="+", help="ingest: explicit tickers (overrides --universe)")
-    group.add_argument("--universe", choices=["xbi", "core"], help="ingest: XBI holdings (default) or core 20")
+    group.add_argument("--universe", choices=["xbi", "core"], help="ingest: core 20 names (default) or XBI holdings")
     group.add_argument("--start", help="ingest: history start date")
     group.add_argument("--refresh", action="store_true", help="ingest: re-download cached data")
     group.add_argument("--skip-sec", action="store_true", help="ingest: skip SEC download")
@@ -127,6 +131,10 @@ def parse_args():
     group.add_argument("--tune-seeds", type=int, help="tune: seeds per fold per trial")
     group.add_argument("--default-params", action="store_true", help="train: ignore best_params.json")
     group.add_argument("--seeds", type=int, help="train: ensemble size")
+    group.add_argument("--max-weight", type=float, help="tune/train: per-stock weight cap (default 0.15)")
+    group.add_argument("--bond-limit", type=float, help="tune/train: max combined SHY + TLT weight (default 0.25)")
+    group.add_argument("--tilt", type=float, help="tune/train: fix the tilt away from equal weight (tuned if omitted)")
+    group.add_argument("--no-refit", action="store_true", help="train: skip the refit on all training days")
     group.add_argument("--paths", type=int, help="simulate: number of Monte Carlo paths")
     group.add_argument("--pool-start", help="simulate: first day of history to bootstrap from")
 

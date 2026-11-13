@@ -1,0 +1,29 @@
+# Biotech portfolio optimizer — tested with Python 3.12 on macOS.
+# pandas 3.x requires Python >= 3.11.
+
+# Data ingestion
+yfinance==1.7.0
+edgartools==5.62.1
+requests==2.34.2          # XBI holdings download
+openpyxl==3.1.5           # reading the XBI holdings .xlsx
+
+# Data handling
+pandas==3.0.2
+numpy==2.4.4
+pyarrow==26.0.0
+
+# EDA figures
+matplotlib==3.10.7
+
+# Preprocessing
+scikit-learn==1.9.0
+joblib==1.5.3
+
+# Modeling, tuning, simulation
+torch==2.14.1
+optuna==5.0.0
+hmmlearn==0.3.3           # market regime HMM
+
+# News sentiment (FinBERT via transformers; VADER as lightweight fallback)
+transformers==5.21.0
+vaderSentiment==3.3.2
