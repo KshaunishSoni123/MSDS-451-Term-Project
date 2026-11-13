@@ -89,7 +89,9 @@ TRADING_DAYS = 252
 WARMUP_DAYS = 252      # skip the first year, where 252-day features are empty
 RISK_FREE = "SHY"      # cash proxy for excess returns
 BENCHMARK = "XBI"
-COST_BPS = 10          # transaction cost per unit of turnover
+COMMISSION_BPS = 5     # brokerage commission per unit of turnover
+SLIPPAGE_BPS = 5       # execution slippage per unit of turnover
+COST_BPS = COMMISSION_BPS + SLIPPAGE_BPS   # Trading_Cost = |w_t - w_{t-1}| x COST_BPS
 MAX_WEIGHT = 0.15     # per-stock cap (with 20 stocks, 5% would allow no overweights)
 TILT = 0.5             # share of the stock sleeve the model may move away from equal weight
 BOND_LIMIT = 0.25      # SHY + TLT combined never exceed this

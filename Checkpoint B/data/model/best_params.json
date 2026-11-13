@@ -1,14 +1,16 @@
 {
   "hidden": 32,
-  "dropout": 0.3324554882973525,
-  "lr": 0.0012446877416086948,
-  "weight_decay": 1.0174305718608436e-05,
+  "dropout": 0.15874074835996008,
+  "lr": 0.00255982501616269,
+  "weight_decay": 4.660484739624965e-05,
   "batch_size": 32,
   "assets_per_batch": 64,
   "min_epochs": 5,
   "max_weight": 0.15,
-  "turnover_penalty": 0.01550799358548995,
-  "concentration_penalty": 0.01006112709990431,
-  "rank_loss_weight": 0.6212509597378757,
-  "train_hold_days": 21
+  "tilt": 0.3977439796856095,
+  "bond_limit": 0.25,
+  "turnover_penalty": 0.0239390954410671,
+  "concentration_penalty": 0.0030114606840963795,
+  "rank_loss_weight": 0.004433108744122377,
+  "train_hold_days": 63
 }

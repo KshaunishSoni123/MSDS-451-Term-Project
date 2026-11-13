@@ -77,12 +77,18 @@ def parse_args():
     group = parser.add_argument_group("Checkpoint C (bb-backtest, bb-simulate, overlay)")
     group.add_argument("--window", type=int, help="Bollinger SMA / std window (default 20)")
     group.add_argument("--k", type=float, help="Entry threshold in standard deviations (default 2.0)")
-    group.add_argument("--cost-bps", type=float, help="Cost per unit traded, in bps (default 10)")
+    group.add_argument("--commission-bps", type=float,
+                       help="Brokerage commission per unit traded, in bps (default 5)")
+    group.add_argument("--slippage-bps", type=float, help="Slippage per unit traded, in bps (default 5)")
     group.add_argument("--long-exposure", type=float, help="Multiplier on a long signal (default 1.5)")
     group.add_argument("--short-exposure", type=float, help="Multiplier on a short signal (default 0.5)")
     group.add_argument("--bb-paths", type=int, help="bb-simulate: number of Monte Carlo paths")
     group.add_argument("--cash-reserve", type=float,
                        help="overlay: share kept in SHY to fund long tilts (default 0.10)")
+    group.add_argument("--management-fee", type=float, help="overlay: annual management fee (default 0.01)")
+    group.add_argument("--performance-fee", type=float,
+                       help="overlay: performance fee rate over HWM + hurdle (default 0.20)")
+    group.add_argument("--hurdle-rate", type=float, help="overlay: annual hurdle rate (default 0.05)")
 
     args, b_extra = parser.parse_known_args()
     if args.only and (args.from_stage or args.skip):
@@ -102,15 +108,22 @@ def c_args(stage, args):
         out = ["--universe", "core"]
         return out + (["--refresh"] if args.refresh else [])
     out = []
-    for flag, value in (("--window", args.window), ("--k", args.k), ("--cost-bps", args.cost_bps),
+    for flag, value in (("--window", args.window), ("--k", args.k),
+                        ("--commission-bps", args.commission_bps),
+                        ("--slippage-bps", args.slippage_bps),
                         ("--long-exposure", args.long_exposure),
                         ("--short-exposure", args.short_exposure)):
         if value is not None:
             out += [flag, str(value)]
     if stage == "bb-simulate" and args.bb_paths is not None:
         out += ["--paths", str(args.bb_paths)]
-    if stage == "overlay" and args.cash_reserve is not None:
-        out += ["--cash-reserve", str(args.cash_reserve)]
+    if stage == "overlay":
+        for flag, value in (("--cash-reserve", args.cash_reserve),
+                            ("--management-fee", args.management_fee),
+                            ("--performance-fee", args.performance_fee),
+                            ("--hurdle-rate", args.hurdle_rate)):
+            if value is not None:
+                out += [flag, str(value)]
     return out
 
 

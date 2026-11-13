@@ -32,10 +32,26 @@ Rules:
     * Stocks the LSTM does not hold are never traded (1.5 x 0 = 0).
     * At each rebalance the base resets to the new LSTM weights and any
       active multiplier is applied to the new base.
-    * Costs: ``--cost-bps`` per unit traded on every leg (the stock and the
-      SHY side), charged against the next day's return. This matches
-      Checkpoint B's run_holding_period, so the overlay-off run reproduces
-      Checkpoint B's LSTM backtest.
+    * Trading costs, on every leg (the stock and the SHY side):
+          Turnover_t     = sum |Weight_t - Weight_{t-1}|
+          Trading_Cost_t = Turnover_t x (commission_bps + slippage_bps)
+      subtracted from the next day's gross return (defaults 5 + 5 bps).
+      This matches Checkpoint B's run_holding_period, so the overlay-off run
+      reproduces Checkpoint B's LSTM backtest.
+
+Fund fees (apply_fund_fees), charged on top of trading costs to the three
+LSTM portfolios. Equal weight and XBI are benchmarks and stay gross.
+    * Management fee: ``--management-fee`` a year (default 1%), accrued
+      daily on AUM as management_fee / 252.
+    * Performance fee, crystallized every ``--fee-period`` trading days
+      (default 252, annual) and at the end of the backtest:
+          Excess_Return = (AUM - HWM) - HWM x Hurdle_Rate
+          if Excess_Return > 0:
+              Performance_Fee = Excess_Return x Performance_Rate
+              HWM = AUM - Performance_Fee
+      Hurdle_Rate is ``--hurdle-rate`` a year, prorated to the period length
+      (default 5%); Performance_Rate is ``--performance-fee`` (default 20%).
+      HWM starts at the starting capital and never falls.
 
 Trade PnL is the tilt's contribution in dollars: (holding - neutral holding)
 x (stock return - SHY return), since SHY funds the tilt, minus the costs of
@@ -50,16 +66,19 @@ Inputs (from Checkpoint B):
     data/raw/prices.parquet                 prices the LSTM was backtested on
 
 Outputs (data/results/):
-    overlay_returns.parquet      daily returns: overlay, LSTM with the cash reserve,
-                                 LSTM only, equal weight, XBI
+    overlay_returns.parquet      daily returns net of all fees: overlay, LSTM with the
+                                 cash reserve, LSTM only, equal weight, XBI; plus
+                                 lstm_bollinger_gross (trading costs only)
+    overlay_fees.csv             daily fee ledger for the overlay: AUM, HWM, fees
     overlay_weights.parquet      daily portfolio weights with the overlay
     overlay_trades.csv           every tilt round trip
     overlay_ticker_report.csv    latest bands + trade stats per ticker
-    overlay_summary.csv          total return, CAGR, Sharpe, closed trades
+    overlay_summary.csv          total return, CAGR, Sharpe, closed trades, fees paid
 
 Usage:
     python overlay_backtest.py
-    python overlay_backtest.py --k 2.5 --cost-bps 20
+    python overlay_backtest.py --k 2.5 --slippage-bps 15
+    python overlay_backtest.py --management-fee 0.02 --performance-fee 0.2 --hurdle-rate 0
     python overlay_backtest.py --cash-reserve 0.05
     python overlay_backtest.py --checkpoint-b ../"Checkpoint B"
 """
@@ -72,8 +91,8 @@ import numpy as np
 import pandas as pd
 
 from bollinger_trading import (
-    RESULTS_DIR, BollingerMeanReversion, add_exposure_args, load_prices,
-    performance_metrics,
+    RESULTS_DIR, TRADING_DAYS, BollingerMeanReversion, add_cost_args, add_exposure_args,
+    cost_bps, load_prices, performance_metrics,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -222,6 +241,44 @@ def simulate(weights, returns, signals, strategy, capital, overlay=True, reserve
 
 
 # ---------------------------------------------------------------------------
+# Fund fees
+# ---------------------------------------------------------------------------
+
+def apply_fund_fees(returns, capital, management_fee, performance_rate, hurdle_rate,
+                    period_days=TRADING_DAYS):
+    """Charge a management fee and a high-water-mark performance fee.
+
+    ``returns`` are daily returns after trading costs. Each day AUM grows by
+    the return, then pays management_fee / 252 of itself. Every
+    ``period_days`` days, and on the last day, the performance fee
+    crystallizes on the gain over HWM above the (prorated) hurdle.
+
+    Returns (daily returns net of fees, daily ledger).
+    """
+    aum = hwm = float(capital)
+    since, rows = 0, []
+    for t, (date, r) in enumerate(returns.items()):
+        start = aum
+        aum *= 1 + r
+        mgmt = aum * management_fee / TRADING_DAYS
+        aum -= mgmt
+        since += 1
+        perf, crystallized = 0.0, since == period_days or t == len(returns) - 1
+        if crystallized:
+            excess = (aum - hwm) - hwm * hurdle_rate * since / TRADING_DAYS
+            if excess > 0:
+                perf = excess * performance_rate
+                aum -= perf
+                hwm = aum
+            since = 0
+        rows.append({"date": date, "gross_return": r, "net_return": aum / start - 1,
+                     "aum": aum, "hwm": hwm, "management_fee": mgmt,
+                     "performance_fee": perf, "crystallized": crystallized})
+    ledger = pd.DataFrame(rows).set_index("date")
+    return ledger["net_return"], ledger
+
+
+# ---------------------------------------------------------------------------
 # Reports
 # ---------------------------------------------------------------------------
 
@@ -256,15 +313,20 @@ def ticker_report(stocks, indicators, signals, weights, daily_w, trades):
     return report
 
 
-def overall_summary(series, rf, n_closed):
+def overall_summary(series, rf, n_closed, fees):
+    """``fees`` maps a portfolio name to its fee ledger from apply_fund_fees."""
     rows = {}
     for name, r in series.items():
         m = performance_metrics(r, rf=rf)
+        ledger = fees.get(name)
         rows[name] = {
             "total_return_pct": 100 * m["total_return"],
             "cagr_pct": 100 * m["cagr"],
             "sharpe": m["sharpe"],
+            "max_drawdown_pct": 100 * m["max_drawdown"],
             "closed_trades": n_closed.get(name, np.nan),
+            "management_fees_usd": ledger["management_fee"].sum() if ledger is not None else np.nan,
+            "performance_fees_usd": ledger["performance_fee"].sum() if ledger is not None else np.nan,
         }
     summary = pd.DataFrame(rows).T.astype(float)
     summary["closed_trades"] = summary["closed_trades"].astype("Int64")
@@ -287,9 +349,18 @@ def parse_args():
     parser.add_argument("--trend-window", type=int, default=200, help="Regime filter SMA window")
     parser.add_argument("--no-trend-filter", action="store_true", help="Disable the 200-day SMA filter")
     parser.add_argument("--long-only", action="store_true", help="Disable short (0.5x) signals")
-    parser.add_argument("--cost-bps", type=float, default=10.0, help="Cost per unit traded, in bps")
+    add_cost_args(parser)
     parser.add_argument("--cash-reserve", type=float, default=0.10,
                         help="Share of the portfolio kept in SHY to fund long tilts (default 0.10)")
+    group = parser.add_argument_group("fund fees (LSTM portfolios only)")
+    group.add_argument("--management-fee", type=float, default=0.01,
+                       help="Annual management fee, accrued daily (default 0.01)")
+    group.add_argument("--performance-fee", type=float, default=0.20,
+                       help="Share of the gain above HWM + hurdle taken as a fee (default 0.20)")
+    group.add_argument("--hurdle-rate", type=float, default=0.05,
+                       help="Annual hurdle over the HWM before a performance fee is due (default 0.05)")
+    group.add_argument("--fee-period", type=int, default=TRADING_DAYS,
+                       help="Trading days between performance-fee crystallizations (default 252)")
     add_exposure_args(parser)
     return parser.parse_args()
 
@@ -305,7 +376,7 @@ def main():
     strategy = BollingerMeanReversion(
         window=args.window, k=args.k, trend_window=args.trend_window,
         use_trend_filter=not args.no_trend_filter, allow_short=not args.long_only,
-        cost_bps=args.cost_bps, baseline=args.baseline,
+        cost_bps=cost_bps(args), baseline=args.baseline,
         long_exposure=args.long_exposure, short_exposure=args.short_exposure,
     )
     log.info("LSTM base: %d stocks + %s, %d rebalances %s -> %s; overlay %s",
@@ -329,21 +400,30 @@ def main():
     (log.info if gap < 1e-6 else log.warning)(
         "LSTM-only vs Checkpoint B backtest: max daily return difference %.2e", gap)
 
-    series = {
+    # Fund fees on the three LSTM portfolios; benchmarks stay gross
+    gross = {
         "lstm_bollinger": ret_overlay,
         f"lstm_cash_{100 * args.cash_reserve:.0f}pct": ret_reserve,
         "lstm_only": ret_lstm,
-        "equal_weight": b_returns["equal_weight"],
-        "xbi": b_returns["xbi"],
     }
+    series, fees = {}, {}
+    for name, r in gross.items():
+        series[name], fees[name] = apply_fund_fees(
+            r, args.capital, args.management_fee, args.performance_fee,
+            args.hurdle_rate, args.fee_period)
+    series["lstm_bollinger_gross"] = ret_overlay
+    series["equal_weight"] = b_returns["equal_weight"]
+    series["xbi"] = b_returns["xbi"]
+
     rf = returns[CASH].iloc[1:]
     closed = trades[trades["exit_reason"] != "open"]
-    summary = overall_summary(series, rf, {"lstm_bollinger": len(closed)})
+    summary = overall_summary(series, rf, {"lstm_bollinger": len(closed)}, fees)
     report = ticker_report(stocks, indicators, signals, weights, w_overlay, trades)
 
     pd.DataFrame(series).to_parquet(RESULTS_DIR / "overlay_returns.parquet")
     w_overlay.to_parquet(RESULTS_DIR / "overlay_weights.parquet")
     trades.to_csv(RESULTS_DIR / "overlay_trades.csv", index=False)
+    fees["lstm_bollinger"].to_csv(RESULTS_DIR / "overlay_fees.csv")
     report.to_csv(RESULTS_DIR / "overlay_ticker_report.csv")
     summary.to_csv(RESULTS_DIR / "overlay_summary.csv")
     log.info("Wrote overlay results to %s", RESULTS_DIR)
@@ -354,7 +434,10 @@ def main():
               f"${args.capital:,.0f} starting capital)")
         print(report.to_string())
         print(f"\nOverall performance {calendar[1].date()} -> {calendar[-1].date()} "
-              "(Sharpe in excess of SHY)")
+              "(Sharpe in excess of SHY). LSTM portfolios are net of trading costs "
+              f"({strategy.cost_bps:g} bps), a {100 * args.management_fee:g}% management fee and a "
+              f"{100 * args.performance_fee:g}% performance fee over HWM + "
+              f"{100 * args.hurdle_rate:g}% hurdle; lstm_bollinger_gross is before fund fees.")
         print(summary.to_string(na_rep="-"))
         limited = int(trades["shy_limited"].sum())
         print(f"\nCash reserve {100 * args.cash_reserve:.0f}%. Average SHY weight: overlay "

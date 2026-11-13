@@ -31,7 +31,12 @@ long/short strategy.
 
 Execution: signals are computed from the close of day t and filled at that
 close, so the position earns the return from t to t+1. Every change in
-position pays ``cost_bps`` per unit traded (100% -> 150% is 0.5 units).
+position pays ``cost_bps`` per unit traded (100% -> 150% is 0.5 units):
+
+    Turnover_t     = |position_t - position_{t-1}|
+    Trading_Cost_t = Turnover_t x (commission_bps + slippage_bps) / 1e4
+
+subtracted from the gross daily return (defaults 5 + 5 = 10 bps).
 
 Inputs:  data/raw/prices.parquet   (written by data_ingestion.py)
 Outputs: data/results/bb_metrics.csv          per-ticker and portfolio metrics
@@ -45,7 +50,7 @@ Outputs: data/results/bb_metrics.csv          per-ticker and portfolio metrics
 Usage:
     python bollinger_trading.py
     python bollinger_trading.py --tickers VRTX REGN AMGN --k 2.5 --window 20
-    python bollinger_trading.py --no-trend-filter --cost-bps 20
+    python bollinger_trading.py --no-trend-filter --commission-bps 5 --slippage-bps 15
     python bollinger_trading.py --sweep
 """
 
@@ -63,6 +68,8 @@ PRICES_PATH = ROOT / "data" / "raw" / "prices.parquet"
 RESULTS_DIR = ROOT / "data" / "results"
 
 TRADING_DAYS = 252
+COMMISSION_BPS = 5.0   # brokerage commission per unit traded
+SLIPPAGE_BPS = 5.0     # bid-ask / execution slippage per unit traded
 
 # Benchmarks written by data_ingestion.py; never traded by the strategy
 BENCHMARK_TICKERS = {"XBI", "IBB", "XLV", "SPY", "TLT", "SHY", "^VIX"}
@@ -135,7 +142,8 @@ class BollingerMeanReversion:
     allow_short : bool
         Set False for a long-only version.
     cost_bps : float
-        Transaction cost per unit of position traded, in basis points.
+        Trading cost per unit of position traded, in basis points
+        (commission + slippage).
     baseline : float
         Exposure held when there is no signal (1.0 = fully invested).
     long_exposure : float
@@ -148,7 +156,7 @@ class BollingerMeanReversion:
     trend_window: int = 200
     use_trend_filter: bool = True
     allow_short: bool = True
-    cost_bps: float = 10.0
+    cost_bps: float = COMMISSION_BPS + SLIPPAGE_BPS
     baseline: float = 1.0
     long_exposure: float = 1.5
     short_exposure: float = 0.5
@@ -459,6 +467,18 @@ def sweep(px, tickers, base, windows, ks):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def add_cost_args(parser):
+    """Trading cost per unit traded = commission + slippage (bps)."""
+    parser.add_argument("--commission-bps", type=float, default=COMMISSION_BPS,
+                        help=f"Brokerage commission per unit traded, in bps (default {COMMISSION_BPS:g})")
+    parser.add_argument("--slippage-bps", type=float, default=SLIPPAGE_BPS,
+                        help=f"Slippage per unit traded, in bps (default {SLIPPAGE_BPS:g})")
+
+
+def cost_bps(args):
+    return args.commission_bps + args.slippage_bps
+
+
 def add_exposure_args(parser):
     parser.add_argument("--baseline", type=float, default=1.0,
                         help="Exposure with no signal (0 for the pure long/short strategy)")
@@ -477,7 +497,7 @@ def parse_args():
     parser.add_argument("--trend-window", type=int, default=200, help="Regime filter SMA window")
     parser.add_argument("--no-trend-filter", action="store_true", help="Disable the 200-day SMA filter")
     parser.add_argument("--long-only", action="store_true", help="Disable short entries")
-    parser.add_argument("--cost-bps", type=float, default=10.0, help="Cost per unit traded, in bps")
+    add_cost_args(parser)
     add_exposure_args(parser)
     parser.add_argument("--start", default=None, help="Only trade from this date, YYYY-MM-DD")
     parser.add_argument("--min-history", type=int, default=250,
@@ -515,7 +535,7 @@ def main():
     strategy = BollingerMeanReversion(
         window=args.window, k=args.k, trend_window=args.trend_window,
         use_trend_filter=not args.no_trend_filter, allow_short=not args.long_only,
-        cost_bps=args.cost_bps, baseline=args.baseline,
+        cost_bps=cost_bps(args), baseline=args.baseline,
         long_exposure=args.long_exposure, short_exposure=args.short_exposure,
     )
     log.info("Backtesting %d tickers with %s", len(tickers), strategy)

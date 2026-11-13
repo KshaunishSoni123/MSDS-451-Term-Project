@@ -47,7 +47,7 @@ import pandas as pd
 
 from bollinger_trading import (
     BENCHMARK_TICKERS, RESULTS_DIR, TRADING_DAYS, BollingerMeanReversion,
-    add_exposure_args, load_prices,
+    add_cost_args, add_exposure_args, cost_bps, load_prices,
 )
 
 log = logging.getLogger("bollinger_monte_carlo")
@@ -259,7 +259,7 @@ def parse_args():
     parser.add_argument("--trend-window", type=int, default=200, help="Regime filter SMA window")
     parser.add_argument("--no-trend-filter", action="store_true", help="Disable the 200-day SMA filter")
     parser.add_argument("--long-only", action="store_true", help="Disable short entries")
-    parser.add_argument("--cost-bps", type=float, default=10.0, help="Cost per unit traded, in bps")
+    add_cost_args(parser)
     add_exposure_args(parser)
     return parser.parse_args()
 
@@ -280,7 +280,7 @@ def main():
     strategy = BollingerMeanReversion(
         window=args.window, k=args.k, trend_window=args.trend_window,
         use_trend_filter=not args.no_trend_filter, allow_short=not args.long_only,
-        cost_bps=args.cost_bps, baseline=args.baseline,
+        cost_bps=cost_bps(args), baseline=args.baseline,
         long_exposure=args.long_exposure, short_exposure=args.short_exposure,
     )
     log.info("%s on %d tickers", strategy, len(tickers))
