@@ -7,7 +7,7 @@ synthetic 20-year price histories from the real data and runs the same
 strategy (BollingerMeanReversion) on every one of them.
 
 Path generation: stationary block bootstrap (Politis & Romano, 1994)
-    * Daily log returns of every traded ticker plus XBI are resampled in
+    * Daily log returns of every traded ticker plus XBI and SPY are resampled in
       blocks of consecutive real trading days. Block lengths are geometric
       with mean ``--block-length``.
     * Whole dates are drawn jointly across tickers, which keeps the
@@ -25,10 +25,10 @@ Path generation: stationary block bootstrap (Politis & Romano, 1994)
 
 Each path is traded as the equal-weight portfolio from bollinger_trading.py
 (1/N capital per ticker) and compared on the same path with equal-weight
-buy-and-hold and with XBI.
+buy-and-hold, XBI and SPY.
 
 Outputs (data/results/):
-    bb_mc_paths.parquet       one row per path: strategy, buy-hold and XBI metrics
+    bb_mc_paths.parquet       one row per path: strategy, buy-hold, XBI and SPY metrics
     bb_mc_summary.csv         percentiles of each metric across paths
     bb_mc_equity_bands.parquet  percentiles of portfolio equity over time
 
@@ -158,7 +158,8 @@ def path_metrics(r, prefix):
 
 def run(strategy, px, tickers, n_paths, years, mean_block, batch_size, seed):
     rng = np.random.default_rng(seed)
-    cols = tickers + (["XBI"] if "XBI" in px else [])
+    benchmarks = [b for b in ("XBI", "SPY") if b in px]
+    cols = tickers + benchmarks
     log_rets = np.log(px[cols]).diff().iloc[1:].to_numpy()
     # Drop dates where nothing traded (e.g. leading NaN rows)
     log_rets = log_rets[~np.isnan(log_rets).all(axis=1)]
@@ -190,9 +191,8 @@ def run(strategy, px, tickers, n_paths, years, mean_block, batch_size, seed):
         batch = {"path": np.arange(b0, b0 + nb)}
         batch.update(path_metrics(port, "strategy"))
         batch.update(path_metrics(buy_hold, "buy_hold"))
-        if "XBI" in cols:
-            xbi = np.exp(sim[warmup:, :, -1]) - 1
-            batch.update(path_metrics(xbi, "xbi"))
+        for k, b in enumerate(benchmarks):
+            batch.update(path_metrics(np.exp(sim[warmup:, :, n_tick + k]) - 1, b.lower()))
         batch["n_trades"] = entries.sum(axis=(0, 2))
         batch["n_long"] = (entries & (signal > 0)).sum(axis=(0, 2))
         batch["n_short"] = (entries & (signal < 0)).sum(axis=(0, 2))
@@ -232,9 +232,11 @@ def summarize(paths):
         "P(strategy max DD shallower than buy-hold)":
             (paths["strategy_max_drawdown"] > paths["buy_hold_max_drawdown"]).mean(),
     }
-    if "xbi_cagr" in paths:
-        probs["P(strategy CAGR > XBI CAGR)"] = (paths["strategy_cagr"] > paths["xbi_cagr"]).mean()
-        probs["P(strategy Sharpe > XBI Sharpe)"] = (paths["strategy_sharpe"] > paths["xbi_sharpe"]).mean()
+    for b in ("xbi", "spy"):
+        if f"{b}_cagr" in paths:
+            probs[f"P(strategy CAGR > {b.upper()} CAGR)"] = (paths["strategy_cagr"] > paths[f"{b}_cagr"]).mean()
+            probs[f"P(strategy Sharpe > {b.upper()} Sharpe)"] = (
+                paths["strategy_sharpe"] > paths[f"{b}_sharpe"]).mean()
     return summary, pd.Series(probs, name="probability")
 
 
@@ -248,7 +250,8 @@ def parse_args():
     parser.add_argument("--years", type=int, default=20, help="Years per path (after warm-up)")
     parser.add_argument("--block-length", type=float, default=63,
                         help="Mean bootstrap block length in trading days")
-    parser.add_argument("--batch-size", type=int, default=100, help="Paths simulated per batch")
+    parser.add_argument("--batch-size", type=int, default=20,
+                        help="Paths simulated per batch (memory scales with batch x tickers)")
     parser.add_argument("--seed", type=int, default=451, help="Random seed")
     parser.add_argument("--tickers", nargs="+", default=None,
                         help="Tickers to trade (default: every non-benchmark ticker in prices.parquet)")
@@ -296,7 +299,7 @@ def main():
     log.info("Wrote results to %s", RESULTS_DIR)
 
     show = [f"{p}_{m}" for m in ("cagr", "sharpe", "max_drawdown", "terminal_wealth")
-            for p in ("strategy", "buy_hold", "xbi") if f"{p}_{m}" in paths]
+            for p in ("strategy", "buy_hold", "xbi", "spy") if f"{p}_{m}" in paths]
     show += ["n_trades", "time_tilted", "avg_exposure"]
     with pd.option_context("display.float_format", "{:.3f}".format, "display.width", 140):
         print(f"\nMonte Carlo: {args.paths:,} paths x {args.years} years")

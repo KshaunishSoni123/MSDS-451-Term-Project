@@ -11,12 +11,22 @@ Loss (per decision day t):
     + turnover_penalty      * turnover(w_t, drifted w_{t-HOLD_DAYS})
     + concentration_penalty * normalized HHI(w_t)
     - rank_loss_weight      * corr(log w_t, forward returns)   (cross-sectional)
+    + cvar_penalty          * max(0, CVaR_5%(daily net returns) - cvar_budget)
 
 Turnover is measured against the portfolio the model would have chosen one
 rebalance earlier, drifted by realized returns. The rank term rewards ordering
 stocks by their future return, a denser signal than portfolio Sharpe alone.
 Training on 21-day windows (train_hold_days) is another way to cut target
 noise; evaluation always uses the real quarterly (HOLD_DAYS) rebalance.
+
+The CVaR term is the only one that rewards holding SHY. Sharpe is measured in
+excess of SHY, so moving weight into SHY scales the excess mean and the excess
+volatility by the same factor and leaves Sharpe unchanged: without a tail-risk
+term the model has no reason to hold it. The penalty is a hinge on a budget
+(a daily 5% CVaR of ``cvar_budget``) rather than plain CVaR, because plain CVaR
+always favors more SHY and, with nothing pulling the other way, would pin the
+bond sleeve at its limit in every market. With the hinge, SHY is only bought in
+windows whose tail risk exceeds the budget.
 
 Architecture: one LSTM is shared across all assets. For each asset it reads
 that asset's features plus the market regime features (including the HMM bear
@@ -53,7 +63,7 @@ Outputs:
     data/model/lstm.pt                     Ensemble weights + params
     data/results/backtest_returns.parquet  Daily out-of-sample returns
     data/results/backtest_weights.parquet  Weights at each rebalance
-    data/results/backtest_metrics.csv      LSTM vs equal weight vs XBI
+    data/results/backtest_metrics.csv      LSTM vs equal weight vs XBI vs SPY
 
 Usage:
     python lstm_model.py                    # uses best_params.json if present
@@ -92,11 +102,14 @@ BENCHMARK = "XBI"
 COMMISSION_BPS = 5     # brokerage commission per unit of turnover
 SLIPPAGE_BPS = 5       # execution slippage per unit of turnover
 COST_BPS = COMMISSION_BPS + SLIPPAGE_BPS   # Trading_Cost = |w_t - w_{t-1}| x COST_BPS
-MAX_WEIGHT = 0.15     # per-stock cap (with 20 stocks, 5% would allow no overweights)
+MAX_WEIGHT = 0.05      # per-stock cap (~8x equal weight across the ~150 XBI names)
 TILT = 0.5             # share of the stock sleeve the model may move away from equal weight
 BOND_LIMIT = 0.25      # SHY + TLT combined never exceed this
 N_FOLDS = 3            # walk-forward validation folds
 N_SEEDS = 5            # ensemble size
+CVAR_ALPHA = 0.05      # tail probability for the CVaR penalty
+CVAR_BUDGET = 0.035    # daily 5% CVaR allowed before the penalty applies
+                       # (about the median 63-day equal-weight CVaR in training)
 SEED = 451
 
 DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -115,6 +128,8 @@ DEFAULT_PARAMS = {
     "turnover_penalty": 0.0,
     "concentration_penalty": 0.0,
     "rank_loss_weight": 0.0,
+    "cvar_penalty": 0.0,
+    "cvar_budget": CVAR_BUDGET,
     "train_hold_days": HOLD_DAYS,
 }
 
@@ -171,6 +186,7 @@ def load_inputs():
         "returns": rets[tickers].to_numpy(),
         "rf": rets[RISK_FREE].fillna(0).to_numpy(),
         "bench": rets[BENCHMARK].fillna(0).to_numpy(),
+        "spy": rets["SPY"].fillna(0).to_numpy(),
         "tradable": eligible & px[tickers].notna().to_numpy(),
         "cutoff_idx": int(dates.searchsorted(test_start)),
     }
@@ -369,6 +385,13 @@ def rank_correlation(weights, fwd_returns, mask):
     return (xc * yc).sum(1) / (xc.pow(2).sum(1) * yc.pow(2).sum(1) + 1e-12).sqrt()
 
 
+def tail_risk(port_returns, alpha=CVAR_ALPHA):
+    """Daily CVaR per row (B, H) -> (B,): mean loss over the worst alpha share
+    of days (at least one), as a positive number."""
+    k = max(1, int(np.ceil(alpha * port_returns.shape[1])))
+    return -torch.topk(port_returns, k, dim=1, largest=False).values.mean(1)
+
+
 def batch(t, idx, assets, hold):
     prev = idx - HOLD_DAYS
     fwd = idx[:, None] + torch.arange(1, hold + 1, device=DEVICE)
@@ -397,14 +420,19 @@ def regularized_loss(model, b, params):
     sharpe = sharpe_ratio(port, b["rf"]).mean()
     conc = concentration(w, b["tradable"]).mean()
     rank = rank_correlation(w, b["fwd"], b["tradable"] & ~b["is_safe"]).mean()
+    cvar = tail_risk(port)
+    tail = (cvar - params["cvar_budget"]).clamp(min=0).mean()
 
     loss = (
         -sharpe
         + params["turnover_penalty"] * trade.mean()
         + params["concentration_penalty"] * conc
         - params["rank_loss_weight"] * rank
+        + params["cvar_penalty"] * tail
     )
-    return loss, {"sharpe": sharpe.item(), "turnover": trade.mean().item(), "rank": rank.item()}
+    return loss, {"sharpe": sharpe.item(), "turnover": trade.mean().item(), "rank": rank.item(),
+                  "cvar": cvar.mean().item(),
+                  "safe": (w * b["is_safe"]).sum(1).mean().item()}
 
 
 # ---------------------------------------------------------------------------
@@ -504,9 +532,9 @@ def train(data, params, train_days, val_days, epochs=60, patience=10, seed=SEED,
         if verbose:
             tr = pd.DataFrame(stats).mean()
             log.info(
-                "seed %d epoch %3d  train Sharpe %6.3f turnover %.3f rank %+.3f | "
+                "seed %d epoch %3d  train Sharpe %6.3f turnover %.3f rank %+.3f cvar %.4f | "
                 "val net Sharpe %6.3f turnover %.3f safe %.2f",
-                seed, epoch, tr["sharpe"], tr["turnover"], tr["rank"],
+                seed, epoch, tr["sharpe"], tr["turnover"], tr["rank"], tr["cvar"],
                 val["sharpe"], val["turnover"], val["safe_weight"],
             )
         if epoch < min_epochs:
@@ -655,6 +683,7 @@ def backtest(model, data, t=None):
     dates = data["dates"][start + 1: end + 1]
     daily = pd.DataFrame({k: np.concatenate(v) for k, v in series.items()}, index=dates)
     daily["xbi"] = data["bench"][start + 1: end + 1]
+    daily["spy"] = data["spy"][start + 1: end + 1]
     rf = data["rf"][start + 1: end + 1]
     metrics = pd.DataFrame({c: performance(daily[c].to_numpy(), rf) for c in daily}).T
 
@@ -664,6 +693,8 @@ def backtest(model, data, t=None):
     metrics.loc["lstm", "avg_turnover"] = np.mean(turnover_rows[1:])
     metrics.loc["lstm", "avg_max_weight"] = stocks.max(axis=1).mean()
     metrics.loc["lstm", "avg_safe_weight"] = weights.loc[:, data["is_safe"]].sum(axis=1).mean()
+    metrics.loc["lstm", "avg_shy_weight"] = weights[RISK_FREE].mean()
+    metrics.loc["lstm", "max_shy_weight"] = weights[RISK_FREE].max()
     metrics.loc["lstm", "avg_holdings_over_1pct"] = (stocks > 0.01).sum(axis=1).mean()
     # Active share of the stock sleeve vs equal weight over the stocks it could hold
     sleeve = stocks.div(stocks.sum(axis=1), axis=0)
@@ -691,6 +722,11 @@ def parse_args():
                              f"(default: tuned params, else {TILT})")
     parser.add_argument("--bond-limit", type=float, default=None,
                         help=f"Max combined SHY + TLT weight (default: tuned params, else {BOND_LIMIT})")
+    parser.add_argument("--cvar-penalty", type=float, default=None,
+                        help="Weight on CVaR above the budget (default: tuned params, else 0)")
+    parser.add_argument("--cvar-budget", type=float, default=None,
+                        help=f"Daily 5%% CVaR allowed before the penalty applies "
+                             f"(default: tuned params, else {CVAR_BUDGET})")
     parser.add_argument("--no-refit", action="store_true",
                         help="Deploy the early-stopped models instead of refitting on all training days")
     return parser.parse_args()
@@ -703,7 +739,7 @@ def main():
 
     data = load_inputs()
     params = load_params(args.default_params)
-    for key in ("max_weight", "tilt", "bond_limit"):
+    for key in ("max_weight", "tilt", "bond_limit", "cvar_penalty", "cvar_budget"):
         if getattr(args, key) is not None:
             params[key] = getattr(args, key)
             log.info("%s overridden: %s", key, params[key])

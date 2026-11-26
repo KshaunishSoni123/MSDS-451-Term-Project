@@ -1,57 +1,45 @@
 """
-Data ingestion for the biotech portfolio optimizer.
+Price data for the Bollinger Band strategy.
 
-Pulls raw data for a universe of biotechnology stocks and writes it to
-parquet files under ``data/raw/`` for downstream feature engineering:
+Pulls 20 years of daily prices for a universe of biotechnology stocks and
+writes them to ``data/raw/``:
 
-    universe.csv           XBI holdings snapshot (only with --universe xbi)
+    universe.csv           XBI holdings snapshot (the default universe)
     prices.parquet         Daily OHLCV + adjusted close (yfinance), long format,
                            with Bollinger Band columns (SMA, bands, %B, bandwidth)
-    company_info.parquet   Snapshot of yfinance profile/valuation fields
-    news.parquet           Recent news headlines (yfinance)
-    sec_companies.parquet  SEC company metadata (edgartools)
-    sec_filings.parquet    10-K / 10-Q / 8-K filing index (edgartools)
-    sec_facts.parquet      XBRL financial facts with filing dates (edgartools)
-
-The SEC requires a User-Agent identifying the requester. Set it with:
-
-    export EDGAR_IDENTITY="Your Name your.email@example.com"
 
 Usage:
-    python data_ingestion.py
+    python data_ingestion.py                   # every current XBI holding
+    python data_ingestion.py --refresh         # re-download holdings and prices
+    python data_ingestion.py --universe core   # the 20 names in BIOTECH_TICKERS
     python data_ingestion.py --tickers VRTX REGN AMGN --start 2018-01-01
     python data_ingestion.py --years 10 --bb-window 20 --bb-std 2
-    python data_ingestion.py --skip-sec --refresh
-    python data_ingestion.py --universe xbi    # current XBI holdings instead
 
-The default universe is the 20 names in BIOTECH_TICKERS (core), the same
-stocks as Checkpoint B. Point-in-time eligibility
-(listing history, market cap, liquidity) is applied later in
-feature_engineering.py. Yahoo has no prices for delisted companies, so the
-universe still carries survivorship bias from names that left the index.
+The default universe is every stock in the SPDR S&P Biotech ETF (XBI). The
+holdings snapshot is shared with Checkpoint B: if Checkpoint B has already
+saved universe.csv, the same list is used here, so both checkpoints trade the
+same names. The holdings are today's, and Yahoo has no prices for delisted
+companies, so the universe carries survivorship bias from names that left the
+index.
 """
 
 import argparse
 import io
 import logging
-import os
 import re
-import time
-from datetime import date, datetime, timezone
+import shutil
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
 import requests
 import yfinance as yf
-from edgar import Company, set_identity
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-# US-domiciled biotech names that file 10-K/10-Q with the SEC. Foreign filers
-# (e.g. BNTX, ARGX) file 20-F/6-K and have sparse XBRL coverage, so they are
-# left out of the default universe.
+# A 20-name large/mid-cap subset, kept for quick runs (--universe core).
 BIOTECH_TICKERS = [
     # Large cap
     "AMGN", "GILD", "VRTX", "REGN", "BIIB", "MRNA",
@@ -83,19 +71,9 @@ DEFAULT_START = (pd.Timestamp.today().normalize() - pd.DateOffset(years=HISTORY_
 # Bollinger Bands: SMA(window) +/- num_std * rolling std of adjusted close
 BB_WINDOW = 20
 BB_NUM_STD = 2.0
-SEC_FORMS = ["10-K", "10-Q", "8-K"]
 DATA_DIR = Path(__file__).resolve().parent / "data" / "raw"
-
-INFO_FIELDS = [
-    "shortName", "longName", "sector", "industry", "country", "marketCap",
-    "enterpriseValue", "sharesOutstanding", "floatShares", "beta",
-    "trailingPE", "forwardPE", "priceToBook", "priceToSalesTrailing12Months",
-    "enterpriseToRevenue", "profitMargins", "operatingMargins",
-    "returnOnEquity", "returnOnAssets", "revenueGrowth", "totalCash",
-    "totalDebt", "debtToEquity", "freeCashflow", "heldPercentInsiders",
-    "heldPercentInstitutions", "shortPercentOfFloat", "shortRatio",
-    "fullTimeEmployees",
-]
+# Checkpoint B's holdings snapshot, reused so both checkpoints share a universe
+SHARED_UNIVERSE = Path(__file__).resolve().parent.parent / "Checkpoint B" / "data" / "raw" / "universe.csv"
 
 log = logging.getLogger("data_ingestion")
 
@@ -125,8 +103,12 @@ def fetch_xbi_holdings():
 
 
 def load_universe(refresh=False):
-    """XBI holdings, cached in universe.csv; falls back to BIOTECH_TICKERS."""
+    """XBI holdings: Checkpoint B's snapshot if present, else this checkpoint's
+    cached universe.csv, else a fresh download; falls back to BIOTECH_TICKERS."""
     path = DATA_DIR / "universe.csv"
+    if SHARED_UNIVERSE.exists() and not refresh:
+        shutil.copyfile(SHARED_UNIVERSE, path)
+        log.info("Universe: Checkpoint B's XBI holdings (%s)", SHARED_UNIVERSE)
     if path.exists() and not refresh:
         return pd.read_csv(path)["ticker"].tolist()
     try:
@@ -146,7 +128,7 @@ def cached_tickers(name):
 
 
 # ---------------------------------------------------------------------------
-# yfinance: market data, company info, news
+# yfinance: market data
 # ---------------------------------------------------------------------------
 
 def fetch_prices(tickers, start, end=None):
@@ -217,19 +199,12 @@ def add_bollinger_bands(prices, window=BB_WINDOW, num_std=BB_NUM_STD, price_col=
 # Persistence
 # ---------------------------------------------------------------------------
 
-def save(df, name, append_keys=None):
-    """Write a frame to ``DATA_DIR/<name>.parquet``.
-
-    With ``append_keys``, merge into the existing file and de-duplicate on
-    those keys instead of overwriting (used to accumulate news history).
-    """
+def save(df, name):
+    """Write a frame to ``DATA_DIR/<name>.parquet``."""
     path = DATA_DIR / f"{name}.parquet"
     if df.empty:
         log.warning("Nothing to save for %s", name)
         return
-    if append_keys and path.exists():
-        df = pd.concat([pd.read_parquet(path), df], ignore_index=True)
-        df = df.drop_duplicates(subset=append_keys, keep="last")
     df.to_parquet(path, index=False)
     log.info("Saved %s (%d rows) -> %s", name, len(df), path)
 
@@ -246,8 +221,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--tickers", nargs="+", default=None,
                         help="Biotech tickers to ingest (overrides --universe)")
-    parser.add_argument("--universe", choices=["xbi", "core"], default="core",
-                        help="core: built-in 20 names (default); xbi: current XBI holdings")
+    parser.add_argument("--universe", choices=["xbi", "core"], default="xbi",
+                        help="xbi: every current XBI holding (default); core: built-in 20 names")
     parser.add_argument("--start", default=None,
                         help=f"History start date, YYYY-MM-DD (default: {HISTORY_YEARS} years ago, {DEFAULT_START})")
     parser.add_argument("--years", type=int, default=None,
@@ -258,7 +233,7 @@ def parse_args():
                         help="Bollinger Band width in standard deviations")
     parser.add_argument("--end", default=None, help="History end date, YYYY-MM-DD")
     parser.add_argument("--refresh", action="store_true",
-                        help="Re-download prices and SEC data even if cached")
+                        help="Re-download XBI holdings and prices even if cached")
     return parser.parse_args()
 
 
@@ -292,7 +267,7 @@ def main():
         cached = pd.read_parquet(prices_path, columns=["ticker", "date"])
         spy_start = cached.loc[cached["ticker"] == "SPY", "date"].min()
         history_short = pd.isna(spy_start) or spy_start > start + pd.Timedelta(days=7)
-    if args.refresh or universe_changed or history_short or not is_cached("prices", "company_info"):
+    if args.refresh or universe_changed or history_short or not is_cached("prices"):
         prices = fetch_prices(tickers + BENCHMARK_TICKERS, start.strftime("%Y-%m-%d"), args.end)
         pd.DataFrame({"ticker": tickers}).to_parquet(DATA_DIR / "requested_tickers.parquet", index=False)
     else:

@@ -3,8 +3,8 @@ Monte Carlo simulation of the LSTM portfolio over simulated future markets.
 
 Generates ``N_PATHS`` one-year futures starting from the last real trading day
 and runs the trained LSTM ensemble through each one with quarterly
-rebalancing, alongside equal-weight (biotech only) and XBI benchmarks on the
-same paths.
+rebalancing, alongside equal-weight (biotech only), XBI and SPY benchmarks on
+the same paths.
 
 Simulation method:
     * Stationary block bootstrap (Politis & Romano, 1994) of historical daily
@@ -15,12 +15,11 @@ Simulation method:
     * VIX follows a mean-reverting AR(1) in logs, driven by the residual from
       the same bootstrapped day, so it stays tied to the simulated returns
       without drifting to implausible levels.
-    * At each rebalance the LSTM sees features recomputed from the simulated
-      prices (momentum, volatility, beta, regime, market cap ratios, HMM bear
-      probability) with the same formulas, scalers and HMM as the real
+    * At each rebalance the LSTM sees every feature recomputed from the
+      simulated prices (momentum, volatility, beta, liquidity, regime, HMM
+      bear probability) with the same formulas, scalers and HMM as the real
       pipeline. The HMM filter continues from its real state on the last day.
-      Slow-moving fundamentals, 8-K counts and eligibility are held at their
-      last real values.
+      Eligibility is held at its last real value.
     * The first rebalance uses the real feature history, so it is the same
       portfolio in every path; later rebalances react to each simulated path.
 
@@ -68,12 +67,13 @@ SEED = 451
 MARKET_SERIES = [BENCHMARK, "SPY", "TLT", RISK_FREE]
 VIX = "^VIX"
 
-# Asset features recomputed from simulated prices; everything else is held
+# Asset features recomputed from simulated prices; anything else (the
+# is_safe_haven flag) is held at its last real value
 PRICE_FEATURES = [
-    "mom_12_1", "mom_6_1", "ret_1m", "vol_63d", "vol_252d", "downside_vol_63d",
-    "beta_xbi_252d", "jump_count_252d", "dist_52w_high", "log_dollar_volume_63d",
+    "mom_12_1", "mom_6_1", "ret_1m", "vol_5d", "vol_21d", "vol_63d", "vol_252d",
+    "vol_ratio_21_252", "downside_vol_63d", "beta_xbi_252d", "jump_count_252d",
+    "dist_52w_high", "log_dollar_volume_63d",
 ]
-MARKET_CAP_FEATURES = ["log_market_cap", "book_to_market", "cash_to_market_cap"]
 
 log = logging.getLogger("monte_carlo")
 
@@ -133,7 +133,7 @@ def price_features(px, close, volume, market):
     ann = np.sqrt(TRADING_DAYS)
     r = px / shift(px, 1) - 1
     m = market / shift(market, 1) - 1
-    w63, w252 = (63, 42), (252, 126)       # (window, min_periods) as in feature_engineering
+    w5, w21, w63, w252 = (5, 4), (21, 15), (63, 42), (252, 126)   # as in feature_engineering
     cov = rolling_mean(r * m, *w252) - rolling_mean(r, *w252) * rolling_mean(m, *w252)
     var_m = rolling_mean(m * m, *w252) - rolling_mean(m, *w252) ** 2
     jumps = torch.where(torch.isnan(r), float("nan"), (r.abs() > 0.10).double())
@@ -141,24 +141,16 @@ def price_features(px, close, volume, market):
         "mom_12_1": shift(px, 21) / shift(px, 252) - 1,
         "mom_6_1": shift(px, 21) / shift(px, 126) - 1,
         "ret_1m": px / shift(px, 21) - 1,
+        "vol_5d": rolling_std(r, *w5) * ann,
+        "vol_21d": rolling_std(r, *w21) * ann,
         "vol_63d": rolling_std(r, *w63) * ann,
         "vol_252d": rolling_std(r, *w252) * ann,
+        "vol_ratio_21_252": rolling_std(r, *w21) / rolling_std(r, *w252),
         "downside_vol_63d": rolling_mean(r.clamp(max=0) ** 2, *w63).sqrt() * ann,
         "beta_xbi_252d": cov / var_m,
         "jump_count_252d": rolling_sum(jumps, *w252)[0],
         "dist_52w_high": px / rolling_max(px, *w252) - 1,
         "log_dollar_volume_63d": torch.log(rolling_mean(close * volume, *w63)),
-    }
-
-
-def market_cap_features(close, fundamentals):
-    """close (P, T, N); fundamentals: dict of (N,) last reported raw values."""
-    market_cap = fundamentals["shares_outstanding"] * close
-    liquid = fundamentals["cash"] + torch.nan_to_num(fundamentals["short_term_investments"])
-    return {
-        "log_market_cap": torch.log(market_cap),
-        "book_to_market": fundamentals["equity"] / market_cap,
-        "cash_to_market_cap": liquid / market_cap,
     }
 
 
@@ -222,7 +214,7 @@ def load_market(dates):
     }
 
 
-def last_fundamentals(tickers):
+def last_features(tickers):
     """Last raw (unscaled) feature row per asset."""
     feats = pd.read_parquet(FEATURE_DIR / "stock_features.parquet")
     return feats[feats["date"] == feats["date"].max()].set_index("ticker").reindex(tickers)
@@ -267,7 +259,7 @@ def stationary_bootstrap(rng, n_days, n_paths, horizon, mean_block):
 # Validation: simulated-feature code must reproduce the real pipeline
 # ---------------------------------------------------------------------------
 
-def validate_features(wide, tickers, fundamentals, hmm, n_check=50):
+def validate_features(wide, tickers, hmm, n_check=50):
     adj_all = wide["adj_close"]
     pick = lambda df, names: torch.tensor(df[names].iloc[-HISTORY:].to_numpy())[None]
     market = lambda s: pick(adj_all, [s])
@@ -286,9 +278,6 @@ def validate_features(wide, tickers, fundamentals, hmm, n_check=50):
         errors[name] = np.nanmax(np.abs(values[0, -n_check:].numpy() - real.to_numpy()))
     for name, values in regime.items():
         errors[name] = np.nanmax(np.abs(values[0, -n_check:].numpy() - real_regime[name].reindex(dates).to_numpy()))
-    last = real_stock[real_stock["date"] == dates[-1]].set_index("ticker").reindex(tickers)
-    for name, values in market_cap_features(pick(wide["close"], tickers)[:, -1:], fundamentals).items():
-        errors[name] = np.nanmax(np.abs(values[0, 0].numpy() - last[name].to_numpy()))
 
     # HMM filter on the full real history vs the probabilities preprocessing saved
     obs = regime_model.observations(adj_all).to_numpy()
@@ -323,17 +312,12 @@ def simulate(args):
     k_xbi, k_spy, k_tlt, k_rf = (series.index(s) for s in MARKET_SERIES)
 
     wide = load_market(data["dates"])
-    last = last_fundamentals(tickers)
-    fundamentals = {
-        k: torch.tensor(last[k].to_numpy(dtype=float))
-        for k in ("shares_outstanding", "equity", "cash", "short_term_investments")
-    }
+    last = last_features(tickers)
     held = {
         k: torch.tensor(last[k].to_numpy(dtype=float))
-        for k in scalers["stock"]["features"]
-        if k not in PRICE_FEATURES + MARKET_CAP_FEATURES
+        for k in scalers["stock"]["features"] if k not in PRICE_FEATURES
     }
-    hmm_state = validate_features(wide, tickers, fundamentals, hmm)
+    hmm_state = validate_features(wide, tickers, hmm)
 
     pool, vix_resid, (a, b) = bootstrap_pool(wide["adj_close"], series, args.pool_start)
 
@@ -383,7 +367,6 @@ def simulate(args):
 
         raw = {k: v[:, pos] for k, v in price_features(
             adj_t[..., k_asset], close_t, vol_t, adj_t[..., [k_xbi]]).items()}
-        raw.update(market_cap_features(close_t[:, pos], fundamentals))
         raw.update({k: v.expand(p, n_feature_days, n) for k, v in held.items()})
         regime_raw = {k: v[:, pos] for k, v in regime_features(
             adj_t[..., [k_xbi]], adj_t[..., [k_spy]], adj_t[..., [k_tlt]], vix_t).items()}
@@ -420,6 +403,7 @@ def simulate(args):
 
         returns = {k: np.concatenate(v, axis=1) for k, v in port.items()}
         returns["xbi"] = R[..., k_xbi]
+        returns["spy"] = R[..., k_spy]
         for name, r in returns.items():
             metrics = pd.DataFrame(performance(r, rf))
             metrics.insert(0, "strategy", name)

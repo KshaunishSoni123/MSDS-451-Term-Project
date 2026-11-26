@@ -3,9 +3,9 @@ End-to-end pipeline for the biotech portfolio optimizer.
 
 Runs each stage in order, stopping at the first failure:
 
-    ingest      data_ingestion.py       prices, news, SEC filings and facts
-    features    feature_engineering.py  point-in-time features + sentiment
-    eda         eda.py                  feature distributions + SEC/news coverage
+    ingest      data_ingestion.py       XBI holdings + prices (yfinance)
+    features    feature_engineering.py  point-in-time price features
+    eda         eda.py                  feature distributions and coverage
     preprocess  preprocessing.py        chronological split + scaling
     tune        tune_lstm.py            Optuna search -> best_params.json
     train       lstm_model.py           final LSTM + out-of-sample backtest
@@ -19,7 +19,7 @@ Usage:
     set up a virtual environment with the requirements in requirements.txt, then run:
     ./setup_env.sh                     # one-time, ~40s
     ./run.sh --skip ingest             # pipeline using already-downloaded data
-    ./run.sh                           # full pipeline (needs EDGAR_IDENTITY exported)
+    ./run.sh                           # full pipeline
     source .venv/bin/activate          # if you want to run individual scripts by hand
 
     python portfolio_optimizer.py                        # everything
@@ -27,9 +27,6 @@ Usage:
     python portfolio_optimizer.py --from train           # resume from a stage
     python portfolio_optimizer.py --only simulate --paths 2000
     python portfolio_optimizer.py --refresh --start 2018-01-01 --trials 60
-
-The SEC requires a contact identity for the ingest stage:
-    export EDGAR_IDENTITY="Your Name your.email@example.com"
 """
 
 import argparse
@@ -60,18 +57,19 @@ def stage_args(stage, args):
     forwarded = {
         "ingest": [
             ("--tickers", args.tickers), ("--universe", args.universe), ("--start", args.start),
-            ("--refresh", args.refresh), ("--skip-sec", args.skip_sec),
-            ("--skip-news", args.skip_news),
+            ("--refresh", args.refresh),
         ],
-        "features": [("--sentiment", args.sentiment)],
+        "features": [],
         "eda": [],
         "preprocess": [("--train-frac", args.train_frac)],
         "tune": [("--trials", args.trials), ("--seeds", args.tune_seeds),
                  ("--max-weight", args.max_weight), ("--bond-limit", args.bond_limit),
-                 ("--tilt", args.tilt)],
+                 ("--tilt", args.tilt), ("--cvar-penalty", args.cvar_penalty),
+                 ("--cvar-budget", args.cvar_budget)],
         "train": [("--default-params", args.default_params), ("--seeds", args.seeds),
                   ("--max-weight", args.max_weight), ("--bond-limit", args.bond_limit),
-                  ("--tilt", args.tilt), ("--no-refit", args.no_refit)],
+                  ("--tilt", args.tilt), ("--cvar-penalty", args.cvar_penalty),
+                  ("--cvar-budget", args.cvar_budget), ("--no-refit", args.no_refit)],
         "simulate": [("--paths", args.paths), ("--pool-start", args.pool_start)],
     }[stage]
 
@@ -120,20 +118,21 @@ def parse_args():
 
     group = parser.add_argument_group("forwarded options")
     group.add_argument("--tickers", nargs="+", help="ingest: explicit tickers (overrides --universe)")
-    group.add_argument("--universe", choices=["xbi", "core"], help="ingest: core 20 names (default) or XBI holdings")
+    group.add_argument("--universe", choices=["xbi", "core"], help="ingest: XBI holdings (default) or the core 20 names")
     group.add_argument("--start", help="ingest: history start date")
     group.add_argument("--refresh", action="store_true", help="ingest: re-download cached data")
-    group.add_argument("--skip-sec", action="store_true", help="ingest: skip SEC download")
-    group.add_argument("--skip-news", action="store_true", help="ingest: skip news download")
-    group.add_argument("--sentiment", choices=["finbert", "vader", "none"], help="features: sentiment model")
     group.add_argument("--train-frac", type=float, help="preprocess: fraction of dates for training")
     group.add_argument("--trials", type=int, help="tune: number of Optuna trials")
     group.add_argument("--tune-seeds", type=int, help="tune: seeds per fold per trial")
     group.add_argument("--default-params", action="store_true", help="train: ignore best_params.json")
     group.add_argument("--seeds", type=int, help="train: ensemble size")
-    group.add_argument("--max-weight", type=float, help="tune/train: per-stock weight cap (default 0.15)")
+    group.add_argument("--max-weight", type=float, help="tune/train: per-stock weight cap (default 0.05)")
     group.add_argument("--bond-limit", type=float, help="tune/train: max combined SHY + TLT weight (default 0.25)")
     group.add_argument("--tilt", type=float, help="tune/train: fix the tilt away from equal weight (tuned if omitted)")
+    group.add_argument("--cvar-penalty", type=float,
+                       help="tune/train: fix the weight on tail risk above the budget (tuned if omitted)")
+    group.add_argument("--cvar-budget", type=float,
+                       help="tune/train: daily 5%% CVaR allowed before the penalty applies (default 0.035)")
     group.add_argument("--no-refit", action="store_true", help="train: skip the refit on all training days")
     group.add_argument("--paths", type=int, help="simulate: number of Monte Carlo paths")
     group.add_argument("--pool-start", help="simulate: first day of history to bootstrap from")

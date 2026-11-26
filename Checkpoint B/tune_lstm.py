@@ -11,15 +11,19 @@ one-seed score mostly ranks luck. Only training-period data is used; the test
 period is never seen during tuning.
 
 Searched: tilt (how far the model may move away from equal weight, 0.1-1),
-turnover penalty, rank-loss weight, concentration penalty, training window
+turnover penalty, rank-loss weight, concentration penalty, CVaR penalty
+(tail risk above the budget; the term that makes the model hold SHY), training window
 (21 or 63 days), dropout, learning rate, weight decay. Fixed: hidden size 32,
 the per-stock cap and the bond limit (lstm_model.MAX_WEIGHT / BOND_LIMIT, or
 --max-weight / --bond-limit). --tilt fixes the tilt instead of searching it.
 
-Selection: trials within ``TIE_TOLERANCE`` Sharpe of the best are treated as
-ties, and among them the one with the most consistent score across folds
-(lowest standard deviation) is chosen. If the best trial beats equal weight,
-only tied trials that also beat it are eligible.
+Selection: the trial with the highest lower confidence bound,
+mean - fold_std / sqrt(n_folds), across walk-forward folds. This rewards
+consistency in proportion to its statistical weight. (An earlier rule treated
+every trial within 0.1 Sharpe of the best as tied and picked the lowest fold
+std; seed noise alone is ~0.03, wider than the spread between trials, so it
+tied everything and chose a trial that scored below the untuned baseline.)
+If any trial beats equal weight, only trials that beat it are eligible.
 
 Trial 0 is the unregularized baseline so the result can be compared with it
 directly. Unpromising trials are pruned after their first fold.
@@ -42,11 +46,12 @@ import numpy as np
 import optuna
 
 from lstm_model import (
-    DEFAULT_PARAMS, PARAMS_PATH, RESULTS_DIR, SEED, decision_days, equal_weights,
+    DEFAULT_PARAMS, N_FOLDS, PARAMS_PATH, RESULTS_DIR, SEED, decision_days, equal_weights,
     evaluate, load_inputs, make_folds, to_tensors, train,
 )
 
-TIE_TOLERANCE = 0.1     # Sharpe differences smaller than this are ties
+
+CVAR_RANGE = (10.0, 100.0)  # log-uniform; below ~10 the bond sleeve stays near zero
 
 log = logging.getLogger("tune_lstm")
 
@@ -54,10 +59,13 @@ log = logging.getLogger("tune_lstm")
 def suggest_params(trial, fixed):
     """Search space; ``fixed`` holds settings given on the command line."""
     tilt = fixed["tilt"] if "tilt" in fixed else trial.suggest_float("tilt", 0.1, 1.0)
+    cvar = (fixed["cvar_penalty"] if "cvar_penalty" in fixed
+            else trial.suggest_float("cvar_penalty", *CVAR_RANGE, log=True))
     return {
         **DEFAULT_PARAMS,
         **fixed,
         "tilt": tilt,
+        "cvar_penalty": cvar,
         "turnover_penalty": trial.suggest_float("turnover_penalty", 1e-3, 1.0, log=True),
         "rank_loss_weight": trial.suggest_float("rank_loss_weight", 1e-3, 1.0, log=True),
         "concentration_penalty": trial.suggest_float("concentration_penalty", 1e-3, 1.0, log=True),
@@ -95,17 +103,23 @@ def make_objective(data, t, folds, ew_scores, n_seeds, epochs, patience, fixed):
     return objective
 
 
+def lower_bound(trial):
+    """Mean fold score minus its standard error across folds."""
+    return trial.value - trial.user_attrs["fold_std"] / np.sqrt(N_FOLDS)
+
+
 def select_trial(study):
-    """Most consistent trial among those tied with the best score."""
+    """Completed trial with the highest lower confidence bound."""
     done = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-    best = max(t.value for t in done)
-    tied = [t for t in done if t.value >= best - TIE_TOLERANCE]
-    if best > 0:
-        tied = [t for t in tied if t.value > 0]     # never trade an edge for consistency
-    chosen = min(tied, key=lambda t: t.user_attrs["fold_std"])
-    log.info("%d trials within %.2f of the best (%.3f); chose trial %d "
-             "(score %.3f, fold std %.3f)", len(tied), TIE_TOLERANCE, best,
-             chosen.number, chosen.value, chosen.user_attrs["fold_std"])
+    if any(t.value > 0 for t in done):
+        done = [t for t in done if t.value > 0]     # never trade an edge for consistency
+    for t in sorted(done, key=lower_bound, reverse=True)[:5]:
+        log.info("trial %3d  score %+.3f  fold std %.3f  lower bound %+.3f",
+                 t.number, t.value, t.user_attrs["fold_std"], lower_bound(t))
+    chosen = max(done, key=lower_bound)
+    best = max(done, key=lambda t: t.value)
+    log.info("Chose trial %d (score %+.3f, lower bound %+.3f); best mean score was trial %d (%+.3f)",
+             chosen.number, chosen.value, lower_bound(chosen), best.number, best.value)
     return chosen
 
 
@@ -121,6 +135,11 @@ def parse_args():
                         help="Max combined SHY + TLT weight (default: lstm_model.BOND_LIMIT)")
     parser.add_argument("--tilt", type=float, default=None,
                         help="Fix the tilt away from equal weight instead of searching it")
+    parser.add_argument("--cvar-penalty", type=float, default=None,
+                        help="Fix the CVaR penalty weight instead of searching it")
+    parser.add_argument("--cvar-budget", type=float, default=None,
+                        help="Daily 5%% CVaR allowed before the penalty applies "
+                             "(default: lstm_model.CVAR_BUDGET)")
     return parser.parse_args()
 
 
@@ -142,7 +161,8 @@ def main():
         for _, va in folds
     ]
     log.info("Equal-weight validation Sharpe by fold: %s", np.round(ew_scores, 3))
-    fixed = {k: getattr(args, k) for k in ("max_weight", "bond_limit", "tilt")
+    fixed = {k: getattr(args, k) for k in ("max_weight", "bond_limit", "tilt",
+                                           "cvar_penalty", "cvar_budget")
              if getattr(args, k) is not None}
 
     study = optuna.create_study(
@@ -150,8 +170,10 @@ def main():
         sampler=optuna.samplers.TPESampler(seed=SEED),
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=0),
     )
-    # Baseline: no turnover or rank regularization, 63-day training window
+    # Baseline: no turnover or rank regularization, 63-day training window,
+    # weakest CVaR penalty in the range
     study.enqueue_trial({
+        **({} if args.cvar_penalty is not None else {"cvar_penalty": CVAR_RANGE[0]}),
         "turnover_penalty": 1e-3,
         "rank_loss_weight": 1e-3,
         "concentration_penalty": 1e-3,

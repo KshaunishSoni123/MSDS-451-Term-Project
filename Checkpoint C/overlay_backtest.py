@@ -2,7 +2,7 @@
 Bollinger Band overlay on the Checkpoint B LSTM portfolio.
 
 The LSTM (Checkpoint B, lstm_model.py) sets the baseline portfolio once a
-quarter: weights over the 20 biotech stocks plus SHY and TLT. Between
+quarter: weights over the XBI holdings plus SHY and TLT. Between
 rebalances the Bollinger mean-reversion signal from bollinger_trading.py
 resizes each stock relative to its baseline holding:
 
@@ -40,7 +40,7 @@ Rules:
       reproduces Checkpoint B's LSTM backtest.
 
 Fund fees (apply_fund_fees), charged on top of trading costs to the three
-LSTM portfolios. Equal weight and XBI are benchmarks and stay gross.
+LSTM portfolios. Equal weight, XBI and SPY are benchmarks and stay gross.
     * Management fee: ``--management-fee`` a year (default 1%), accrued
       daily on AUM as management_fee / 252.
     * Performance fee, crystallized every ``--fee-period`` trading days
@@ -62,12 +62,12 @@ Sharpe ratios are on returns in excess of SHY, as in Checkpoint B.
 
 Inputs (from Checkpoint B):
     data/results/backtest_weights.parquet   LSTM weights at each rebalance
-    data/results/backtest_returns.parquet   LSTM / equal-weight / XBI daily returns
+    data/results/backtest_returns.parquet   LSTM / equal-weight / XBI / SPY daily returns
     data/raw/prices.parquet                 prices the LSTM was backtested on
 
 Outputs (data/results/):
     overlay_returns.parquet      daily returns net of all fees: overlay, LSTM with the
-                                 cash reserve, LSTM only, equal weight, XBI; plus
+                                 cash reserve, LSTM only, equal weight, XBI, SPY; plus
                                  lstm_bollinger_gross (trading costs only)
     overlay_fees.csv             daily fee ledger for the overlay: AUM, HWM, fees
     overlay_weights.parquet      daily portfolio weights with the overlay
@@ -290,11 +290,12 @@ def ticker_report(stocks, indicators, signals, weights, daily_w, trades):
     for t in stocks:
         ind = indicators[t].loc[:signals.index[-1]]
         last = ind["z"].last_valid_index()
-        band = ind.loc[last]
+        # Too little history for a full band window (e.g. a recent listing)
+        band = ind.loc[last] if last is not None else pd.Series(np.nan, index=ind.columns)
         c = closed[closed["ticker"] == t]
         state = int(signals[t].iloc[-1])
         rows[t] = {
-            "as_of": last.date(),
+            "as_of": last.date() if last is not None else None,
             "price": band["price"],
             "lower_band": band["lower"],
             "middle_sma": band["sma"],
@@ -414,6 +415,7 @@ def main():
     series["lstm_bollinger_gross"] = ret_overlay
     series["equal_weight"] = b_returns["equal_weight"]
     series["xbi"] = b_returns["xbi"]
+    series["spy"] = b_returns["spy"]
 
     rf = returns[CASH].iloc[1:]
     closed = trades[trades["exit_reason"] != "open"]

@@ -4,8 +4,8 @@ Run Checkpoint B (LSTM portfolio) and Checkpoint C (Bollinger overlay) in order.
 Stages, in run order:
 
     Checkpoint B  (via Checkpoint B/portfolio_optimizer.py)
-        ingest       prices, news, SEC data for the 20 stocks
-        features     point-in-time features + sentiment
+        ingest       XBI holdings + prices for every holding
+        features     point-in-time price features
         eda          feature and coverage plots
         preprocess   chronological split + scaling
         tune         Optuna search -> best_params.json
@@ -13,10 +13,12 @@ Stages, in run order:
         simulate     LSTM Monte Carlo
 
     Checkpoint C
-        bb-ingest    20 years of prices for the standalone Bollinger backtest
+        bb-ingest    20 years of prices (same XBI holdings) for the standalone backtest
         bb-backtest  bollinger_trading.py: standalone strategy, per-ticker report
         bb-simulate  bollinger_monte_carlo.py: Monte Carlo of the standalone strategy
-        overlay      overlay_backtest.py: Bollinger trading on top of the LSTM weights
+        overlay      overlay_backtest.py: Bollinger trading on top of the LSTM weights,
+                     net of trading costs and fund fees
+        compare      fund_comparison.py: our ETF vs XBI vs SPY
 
 Each stage is a separate script and stops the run on failure. Prices are
 cached; pass --refresh to download fresh data in both checkpoints.
@@ -26,12 +28,12 @@ Usage:
     ./run_all.sh --refresh                # same, re-downloading prices
     ./run_all.sh --skip tune simulate bb-simulate   # quick run with current params
     ./run_all.sh --from train             # retrain the LSTM, then rerun Checkpoint C
-    ./run_all.sh --only overlay           # overlay on the current LSTM weights
-    ./run_all.sh --trials 40 --max-weight 0.2 --k 2.5
+    ./run_all.sh --only overlay compare   # overlay on the current LSTM weights
+    ./run_all.sh --trials 40 --max-weight 0.1 --k 2.5
     ./run_all.sh --bond-limit 0.2 --tilt 0.5   # fix the anchor instead of tuning it
 
 Options not listed below (e.g. --trials, --seeds, --max-weight, --tilt,
---bond-limit, --paths, --no-refit) are passed to Checkpoint B's portfolio_optimizer.py; see
+--bond-limit, --cvar-penalty, --cvar-budget, --paths, --no-refit) are passed to Checkpoint B's portfolio_optimizer.py; see
 ``Checkpoint B/portfolio_optimizer.py --help``.
 """
 
@@ -52,6 +54,7 @@ C_STAGES = {
     "bb-backtest": "bollinger_trading.py",
     "bb-simulate": "bollinger_monte_carlo.py",
     "overlay": "overlay_backtest.py",
+    "compare": "fund_comparison.py",
 }
 STAGES = B_STAGES + list(C_STAGES)
 
@@ -105,8 +108,9 @@ def selected_stages(args):
 
 def c_args(stage, args):
     if stage == "bb-ingest":
-        out = ["--universe", "core"]
-        return out + (["--refresh"] if args.refresh else [])
+        return ["--refresh"] if args.refresh else []
+    if stage == "compare":
+        return []
     out = []
     for flag, value in (("--window", args.window), ("--k", args.k),
                         ("--commission-bps", args.commission_bps),

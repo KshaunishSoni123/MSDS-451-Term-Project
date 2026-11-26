@@ -6,9 +6,6 @@
 #   ./run.sh                          # full pipeline
 #   ./run.sh --skip ingest            # reuse downloaded data
 #   ./run.sh --only simulate --paths 2000
-#
-# The ingest stage needs an SEC contact identity:
-#   export EDGAR_IDENTITY="Your Name your.email@example.com"
 
 set -euo pipefail
 

@@ -5,16 +5,11 @@ Reads the raw data from ``data_ingestion.py`` and the features from
 ``feature_engineering.py`` and writes figures and tables to ``data/eda/``:
 
     feature_summary.csv          Distribution stats + missing share per feature
-    sec_coverage.csv             Per-ticker SEC filing counts and metric coverage
-    news_coverage.csv            Per-ticker headline counts and mean sentiment
     price_feature_dist.png       Volatility, momentum, beta, liquidity histograms
-    fundamental_feature_dist.png Size, value, quality and cash runway histograms
-    event_news_feature_dist.png  8-K, earnings and news sentiment histograms
     regime_feature_dist.png      Market regime feature histograms
     volatility_over_time.png     Cross-sectional volatility vs XBI vol and VIX
-    feature_coverage.png         Share of biotech rows with each feature group
-    sec_availability.png         Filings by year / form and metric coverage
-    news_availability.png        Headlines per day / ticker and sentiment
+    feature_coverage.png         Share of biotech rows with price features and
+                                 eligible, plus tickers priced over time
 
 Distributions use biotech (non safe-haven) rows only, and histograms are
 clipped to the 1st/99th percentiles for display so a few extreme values do
@@ -34,14 +29,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from feature_engineering import SAFE_HAVENS, SEC_METRICS
+from feature_engineering import SAFE_HAVENS
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
-RAW_DIR = BASE_DIR / "data" / "raw"
 FEATURE_DIR = BASE_DIR / "data" / "features"
 EDA_DIR = BASE_DIR / "data" / "eda"
 
@@ -50,22 +44,10 @@ PRICE_FEATURES = [
     "beta_xbi_252d", "jump_count_252d", "mom_12_1", "ret_1m",
     "dist_52w_high", "log_dollar_volume_63d",
 ]
-FUNDAMENTAL_FEATURES = [
-    "log_market_cap", "book_to_market", "roe", "net_margin",
-    "operating_margin", "cash_to_market_cap", "cash_runway_years",
-    "is_cash_flow_positive",
-]
-EVENT_NEWS_FEATURES = [
-    "8k_count_63d", "8k_item801_count_63d", "8k_item101_count_63d",
-    "8k_item502_count_252d", "days_to_earnings_est",
-    "news_sentiment_5d", "news_sentiment_21d", "news_count_21d",
-]
 FEATURE_GROUPS = {
-    "price": PRICE_FEATURES,
-    "fundamentals": FUNDAMENTAL_FEATURES,
-    "8-K events": ["8k_count_63d"],
-    "earnings": ["days_to_earnings_est"],
-    "news": ["news_sentiment_21d"],
+    "momentum": ["mom_12_1", "mom_6_1", "ret_1m"],
+    "volatility": ["vol_21d", "vol_252d", "downside_vol_63d"],
+    "beta": ["beta_xbi_252d"],
 }
 
 CLIP_QUANTILES = (0.01, 0.99)
@@ -103,13 +85,14 @@ def hist_grid(df, features, path, title, ncols=4):
 def feature_summary(stock, regime):
     """describe() plus missing share and skew for every model feature.
 
-    Infinite values (e.g. ratios over a zero market cap) are counted in
+    Infinite values (e.g. log of zero dollar volume) are counted in
     ``n_inf`` and excluded from the other statistics.
     """
     biotech = stock[~stock["ticker"].isin(SAFE_HAVENS)]
     rows = []
     for source, df, features in (
-        ("stock", biotech, PRICE_FEATURES + FUNDAMENTAL_FEATURES + EVENT_NEWS_FEATURES),
+        ("stock", biotech, [c for c in stock.columns
+                            if c not in ("date", "ticker", "close", "eligible", "is_safe_haven")]),
         ("regime", regime, [c for c in regime.columns if c != "date"]),
     ):
         for f in features:
@@ -177,86 +160,6 @@ def plot_feature_coverage(stock, path):
     plt.close(fig)
 
 
-def sec_coverage(filings, facts, stock):
-    """Per-ticker filing counts, first filing date and metric coverage."""
-    counts = filings.pivot_table(index="ticker", columns="form", values="accession_number",
-                                 aggfunc="count", fill_value=0)
-    counts = counts[[c for c in ["10-K", "10-Q", "8-K"] if c in counts]]
-    counts["first_filing"] = filings.groupby("ticker")["filing_date"].min()
-
-    # Share of each ticker's trading days on which the joined SEC metric is known
-    biotech = stock[~stock["ticker"].isin(SAFE_HAVENS)]
-    known = biotech.groupby("ticker")[list(SEC_METRICS)].apply(lambda d: d.notna().mean())
-    known.columns = [f"{c}_known_pct" for c in known.columns]
-    out = counts.join(100 * known, how="outer")
-    out["xbrl_facts"] = facts.groupby("ticker").size()
-    num = out.select_dtypes("number").columns
-    out[num] = out[num].round(1)
-    return out.reset_index()
-
-
-def plot_sec_availability(filings, sec_cov, path):
-    f = filings.assign(year=filings["filing_date"].dt.year)
-    f["form_group"] = f["form"].str.replace("/A", "", regex=False)
-    by_year = f.pivot_table(index="year", columns="form_group", values="accession_number",
-                            aggfunc="count", fill_value=0)
-    tickers_by_year = f.groupby("year")["ticker"].nunique()
-
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
-    by_year.plot.bar(stacked=True, ax=axes[0], width=0.8)
-    axes[0].set_title("SEC filings per year by form")
-    axes[0].set_ylabel("filings")
-    ax_t = axes[0].twinx()
-    ax_t.plot(range(len(tickers_by_year)), tickers_by_year.values, color="black", marker="o", ms=3)
-    ax_t.set_ylabel("tickers filing")
-
-    known = sec_cov.filter(like="_known_pct")
-    known.columns = known.columns.str.replace("_known_pct", "")
-    known.median().sort_values().plot.barh(ax=axes[1], color="steelblue")
-    axes[1].set_xlim(0, 100)
-    axes[1].set_title("Median % of trading days\nwith each SEC metric available")
-
-    axes[2].hist(sec_cov["8-K"].dropna(), bins=30, color="steelblue")
-    axes[2].set_title("8-K filings per ticker")
-    axes[2].set_xlabel("8-K count")
-    fig.tight_layout()
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
-
-
-def news_coverage(news, sentiment):
-    scored = news.merge(sentiment[["uuid", "sentiment"]], on="uuid", how="left")
-    return (
-        scored.groupby("ticker")
-        .agg(headlines=("uuid", "nunique"), first=("published_at", "min"),
-             last=("published_at", "max"), mean_sentiment=("sentiment", "mean"),
-             publishers=("publisher", "nunique"))
-        .sort_values("headlines", ascending=False)
-        .reset_index()
-        .round({"mean_sentiment": 3})
-    )
-
-
-def plot_news_availability(news, sentiment, news_cov, path):
-    daily = news.drop_duplicates("uuid").set_index("published_at").resample("D")["uuid"].count()
-
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
-    axes[0].bar(daily.index, daily.values, width=1, color="steelblue")
-    axes[0].set_title("Unique headlines per day")
-    axes[0].tick_params(axis="x", rotation=45)
-
-    axes[1].hist(news_cov["headlines"], bins=30, color="steelblue")
-    axes[1].set_title("Headlines per ticker")
-    axes[1].set_xlabel("headlines")
-
-    axes[2].hist(sentiment["sentiment"].dropna(), bins=40, color="steelblue")
-    axes[2].set_title(f"Headline sentiment ({sentiment['method'].iloc[0]})")
-    axes[2].set_xlabel("positive - negative")
-    fig.tight_layout()
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -268,8 +171,6 @@ def main():
 
     stock = pd.read_parquet(FEATURE_DIR / "stock_features.parquet")
     regime = pd.read_parquet(FEATURE_DIR / "regime_features.parquet")
-    filings = pd.read_parquet(RAW_DIR / "sec_filings.parquet")
-    facts = pd.read_parquet(RAW_DIR / "sec_facts.parquet", columns=["ticker", "concept"])
     biotech = stock[~stock["ticker"].isin(SAFE_HAVENS)]
 
     log.info(
@@ -289,47 +190,10 @@ def main():
 
     hist_grid(biotech, PRICE_FEATURES, EDA_DIR / "price_feature_dist.png",
               "Price features (biotech rows)")
-    hist_grid(biotech, FUNDAMENTAL_FEATURES, EDA_DIR / "fundamental_feature_dist.png",
-              "SEC fundamental features (biotech rows)")
-    hist_grid(biotech, EVENT_NEWS_FEATURES, EDA_DIR / "event_news_feature_dist.png",
-              "8-K, earnings and news features (biotech rows)")
     hist_grid(regime, [c for c in regime.columns if c != "date"],
               EDA_DIR / "regime_feature_dist.png", "Market regime features", ncols=5)
     plot_volatility_over_time(stock, regime, EDA_DIR / "volatility_over_time.png")
     plot_feature_coverage(stock, EDA_DIR / "feature_coverage.png")
-
-    sec_cov = sec_coverage(filings, facts, stock)
-    sec_cov.to_csv(EDA_DIR / "sec_coverage.csv", index=False)
-    plot_sec_availability(filings, sec_cov, EDA_DIR / "sec_availability.png")
-    known = sec_cov.filter(like="_known_pct")
-    log.info(
-        "SEC: %d filings for %d tickers (%s -> %s), %d XBRL facts\n"
-        "Median %% of trading days with each metric:\n%s",
-        len(filings), filings["ticker"].nunique(),
-        filings["filing_date"].min().date(), filings["filing_date"].max().date(),
-        len(facts), known.median().round(1).to_string(),
-    )
-    sparse = sec_cov.loc[known.mean(axis=1) < 50, "ticker"].tolist()
-    if sparse:
-        log.info("Tickers with <50%% SEC metric coverage: %s", ", ".join(sparse))
-
-    news_path, sent_path = RAW_DIR / "news.parquet", FEATURE_DIR / "news_sentiment.parquet"
-    if news_path.exists() and sent_path.exists():
-        news = pd.read_parquet(news_path)
-        sentiment = pd.read_parquet(sent_path)
-        news_cov = news_coverage(news, sentiment)
-        news_cov.to_csv(EDA_DIR / "news_coverage.csv", index=False)
-        plot_news_availability(news, sentiment, news_cov, EDA_DIR / "news_availability.png")
-        in_panel = biotech["news_sentiment_21d"].notna()
-        log.info(
-            "News: %d headlines (%d unique) for %d tickers, %s -> %s; "
-            "median %d per ticker; sentiment known on %.1f%% of biotech panel rows",
-            len(news), news["uuid"].nunique(), news["ticker"].nunique(),
-            news["published_at"].min().date(), news["published_at"].max().date(),
-            news_cov["headlines"].median(), 100 * in_panel.mean(),
-        )
-    else:
-        log.info("No news data; skipping news EDA")
 
     log.info("Saved EDA outputs -> %s", EDA_DIR)
 

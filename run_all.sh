@@ -6,9 +6,6 @@
 # Usage:
 #   ./run_all.sh                    # full refit, every stage
 #   ./run_all.sh --help             # stages and options
-#
-# The ingest stage needs an SEC contact identity when SEC data is not cached:
-#   export EDGAR_IDENTITY="Your Name your.email@example.com"
 
 set -euo pipefail
 
